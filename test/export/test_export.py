@@ -18639,10 +18639,11 @@ def forward(self, q, k, v):
     view_default_6 = torch.ops.aten.view.default(expand_default_5, [32, 256, 256]);  expand_default_5 = None
     bmm_default_1 = torch.ops.aten.bmm.default(view_default_6, view_default_4);  view_default_6 = view_default_4 = None
     view_default_7 = torch.ops.aten.view.default(bmm_default_1, [1, 32, 256, 128]);  bmm_default_1 = None
-    permute_default_1 = torch.ops.aten.permute.default(view_default_7, [2, 0, 1, 3]);  view_default_7 = None
+    permute_default_1 = torch.ops.aten.permute.default(view_default_7, [0, 1, 2, 3]);  view_default_7 = None
     clone_default_2 = torch.ops.aten.clone.default(permute_default_1, memory_format = torch.contiguous_format);  permute_default_1 = None
-    permute_default_2 = torch.ops.aten.permute.default(clone_default_2, [1, 2, 0, 3]);  clone_default_2 = None
-    return (permute_default_2,)""",
+    permute_default_2 = torch.ops.aten.permute.default(clone_default_2, [0, 1, 2, 3]);  clone_default_2 = None
+    as_strided_default = torch.ops.aten.as_strided.default(permute_default_2, [1, 32, 256, 128], [1048576, 32768, 128, 1]);  permute_default_2 = None
+    return (as_strided_default,)""",
             )
         # test backend check for invalid inputs
         error_type = (
