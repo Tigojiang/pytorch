@@ -1423,10 +1423,10 @@ class DecompOneOffTests(TestCase):
                 )
             )
             actual_res = decomposed_res[0]
-            # Output has form (N, H, L, E), but should be continuous on (L, N, H, E)
-            # in order for subsequent view(L * N, H * E) to be valid.
-            # So permute(2, 0, 1, 3) before checking that tensor is contiguous
-            self.assertTrue(actual_res.permute(2, 0, 1, 3).is_contiguous())
+            # Native CPU flash attention allocates empty_like(query).
+            self.assertEqual(
+                actual_res.stride(), torch.empty_like(query_layer).stride()
+            )
 
             eager_res = op(
                 query_layer,
@@ -1438,6 +1438,70 @@ class DecompOneOffTests(TestCase):
             )
 
             self.assertTrue(torch.allclose(actual_res, eager_res, atol=atol, rtol=rtol))
+
+    @onlyCPU
+    def test_cpu_flash_attention_output_layout(self, device):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        def randn(*shape):
+            return torch.randn(*shape, device=device, dtype=torch.double)
+
+        queries = {
+            "contiguous": randn(2, 3, 4, 8),
+            "mha": randn(4, 2, 3, 8).permute(1, 2, 0, 3),
+            "bert": randn(2, 4, 3, 8).transpose(1, 2),
+            "sliced": randn(2, 3, 8, 8)[:, :, ::2, :],
+            "singleton_batch": randn(4, 1, 3, 8).permute(1, 2, 0, 3),
+            "singleton_sequence": randn(2, 1, 3, 8).transpose(1, 2),
+            "empty_batch": randn(4, 0, 3, 8).permute(1, 2, 0, 3),
+        }
+        decompose = (
+            torch._decomp.decompositions.scaled_dot_product_flash_attention_for_cpu
+        )
+        for layout, query in queries.items():
+            with self.subTest(layout=layout):
+                query.requires_grad_()
+                key = torch.randn_like(query, requires_grad=True)
+                value = torch.randn_like(query, requires_grad=True)
+                inputs = (query, key, value)
+                expected = aten._scaled_dot_product_flash_attention_for_cpu(*inputs)[0]
+                actual = decompose(*inputs)[0]
+                self.assertEqual(actual, expected)
+                self.assertEqual(actual.stride(), expected.stride())
+
+                with FakeTensorMode() as mode:
+                    fake_inputs = tuple(mode.from_tensor(x) for x in inputs)
+                    fake_expected = aten._scaled_dot_product_flash_attention_for_cpu(
+                        *fake_inputs
+                    )[0]
+                    fake_actual = decompose(*fake_inputs)[0]
+                self.assertEqual(fake_actual.stride(), fake_expected.stride())
+
+                grad = torch.randn_like(expected)
+                self.assertEqual(
+                    torch.autograd.grad(actual, inputs, grad),
+                    torch.autograd.grad(expected, inputs, grad),
+                )
+
+    @onlyCPU
+    def test_cpu_flash_attention_output_layout_unbacked_batch(self, device):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        shape_env = ShapeEnv()
+        with FakeTensorMode(shape_env=shape_env):
+            batch = shape_env.create_unbacked_symint()
+            torch._constrain_as_size(batch)
+            query = torch.empty(4, batch, 3, 8, device=device).permute(1, 2, 0, 3)
+            inputs = (query, torch.empty_like(query), torch.empty_like(query))
+            expected = aten._scaled_dot_product_flash_attention_for_cpu(*inputs)[0]
+            actual = (
+                torch._decomp.decompositions.scaled_dot_product_flash_attention_for_cpu(
+                    *inputs
+                )[0]
+            )
+            self.assertEqual(actual.shape, expected.shape)
+            self.assertEqual(actual.stride(), expected.stride())
 
     @onlyCPU
     def test_native_layer_norm_cpu_decomp(self, device):
