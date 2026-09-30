@@ -813,17 +813,14 @@ def forward(self, x_1):
 
 
 class TestGenericProxyTensorReal(TestGenericProxyTensor):
-    hw_classification = HardwareClassification.GENERIC
     tracing_mode = "real"
 
 
 class TestGenericProxyTensorFake(TestGenericProxyTensor):
-    hw_classification = HardwareClassification.GENERIC
     tracing_mode = "fake"
 
 
 class TestGenericProxyTensorSymbolic(TestGenericProxyTensor):
-    hw_classification = HardwareClassification.GENERIC
     tracing_mode = "symbolic"
 
 
@@ -2240,7 +2237,7 @@ class TestProxyTensorOpInfo(TestCase):
 instantiate_device_type_tests(TestProxyTensorOpInfo, globals(), only_for="cpu")
 
 
-class TestGenericProxyTensorCUDA(TestCase):
+class TestGenericProxyTensorDevice(TestCase):
     hw_classification = HardwareClassification.CUDA
 
     def test_amp_cache(self, device):
@@ -2250,7 +2247,7 @@ class TestGenericProxyTensorCUDA(TestCase):
             return torch.nn.functional.conv2d(x, w, stride=layer.stride)
 
         inp = torch.randn(4, 3, 10, 10, device=device)
-        with torch.autocast(device):
+        with torch.autocast(torch.device(device).type):
             out_graph = make_fx(f)(inp, layer.weight).graph
             out_graph2 = make_fx(f)(inp, layer.weight).graph
 
@@ -2279,10 +2276,10 @@ class TestGenericProxyTensorCUDA(TestCase):
         )
 
 
-instantiate_device_type_tests(TestGenericProxyTensorCUDA, globals(), only_for="cuda")
+instantiate_device_type_tests(TestGenericProxyTensorDevice, globals(), only_for="cuda")
 
 
-class TestSymbolicTracingCUDA(TestCase):
+class TestSymbolicTracingDevice(TestCase):
     hw_classification = HardwareClassification.CUDA
 
     def test_cpu_scalar_cuda(self, device):
@@ -2303,6 +2300,13 @@ def forward(self, a_1, b_1):
     mm = torch.ops.aten.mm.default(mul, b_1);  mul = b_1 = None
     return mm""",
         )
+
+
+instantiate_device_type_tests(TestSymbolicTracingDevice, globals(), only_for="cuda")
+
+
+class TestUnbackedSymbolicTracingDevice(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
 
     def test_view_divisibility_unbacked_relatively_prime(self, device):
         # See https://github.com/pytorch/pytorch/issues/123651
@@ -2365,9 +2369,7 @@ def forward(self, a_1, b_1):
             torch.tensor(6, device=device),
             torch.tensor(6, device=device),
             torch.tensor([1.0], device=device),
-        ),
-        torch.tensor([2.0], device=device),
-        )
+        ), torch.tensor([2.0], device=device))
         with self.assertRaises(RuntimeError):
             gm(
                 torch.tensor(20, device=device),
@@ -2376,7 +2378,7 @@ def forward(self, a_1, b_1):
                 torch.tensor([1.0], device=device),
             )
 
-instantiate_device_type_tests(TestSymbolicTracingCUDA, globals(), only_for="cuda")
+instantiate_device_type_tests(TestUnbackedSymbolicTracingDevice, globals(), except_for="cpu")
 
 if __name__ == '__main__':
     run_tests()
