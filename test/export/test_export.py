@@ -80,10 +80,12 @@ from torch.testing._internal.common_cuda import (
 )
 from torch.testing._internal.common_utils import (
     find_library_location,
+    instantiate_parametrized_tests,
     IS_FBCODE,
     IS_MACOS,
     IS_SANDCASTLE,
     IS_WINDOWS,
+    parametrize,
     run_tests,
     skipIfCrossRef,
     skipIfRocm,
@@ -18642,8 +18644,7 @@ def forward(self, q, k, v):
     permute_default_1 = torch.ops.aten.permute.default(view_default_7, [0, 1, 2, 3]);  view_default_7 = None
     clone_default_2 = torch.ops.aten.clone.default(permute_default_1, memory_format = torch.contiguous_format);  permute_default_1 = None
     permute_default_2 = torch.ops.aten.permute.default(clone_default_2, [0, 1, 2, 3]);  clone_default_2 = None
-    as_strided_default = torch.ops.aten.as_strided.default(permute_default_2, [1, 32, 256, 128], [1048576, 32768, 128, 1]);  permute_default_2 = None
-    return (as_strided_default,)""",
+    return (permute_default_2,)""",
             )
         # test backend check for invalid inputs
         error_type = (
@@ -18765,9 +18766,12 @@ def forward(self, q, k, v):
         self.assertEqual(ep.module()(x), model(x))
 
 
+@instantiate_parametrized_tests
 @unittest.skipIf(not torchdynamo.is_dynamo_supported(), "dynamo isn't support")
 class TestOneOffModelExportResult(TestCase):
-    def test_cpu_flash_attention_projection_layout(self):
+    @parametrize("sequence_first", [True, False])
+    @parametrize("dynamic", [False, True])
+    def test_cpu_flash_attention_projection_layout(self, sequence_first, dynamic):
         from torch.nn.attention import sdpa_kernel, SDPBackend
 
         class AttentionProjection(torch.nn.Module):
@@ -18794,43 +18798,90 @@ class TestOneOffModelExportResult(TestCase):
                 query = torch.randn(batch, sequence, 4, 8).transpose(1, 2)
             return query, torch.randn_like(query), torch.randn_like(query)
 
-        for sequence_first in (True, False):
-            for dynamic in (False, True):
-                with (
-                    self.subTest(sequence_first=sequence_first, dynamic=dynamic),
-                    sdpa_kernel(SDPBackend.FLASH_ATTENTION),
-                ):
-                    model = AttentionProjection(sequence_first)
-                    example_inputs = inputs(3, 5, sequence_first)
-                    dynamic_shapes = None
-                    if dynamic:
-                        shape = {
-                            0: Dim("batch", min=2),
-                            2: Dim("sequence", min=2),
-                        }
-                        dynamic_shapes = (shape, shape, shape)
-                    ep = export(model, example_inputs, dynamic_shapes=dynamic_shapes)
-                    decomposed = ep.run_decompositions()
-                    targets = {
-                        node.target
-                        for node in decomposed.graph.nodes
-                        if node.op == "call_function"
-                    }
-                    self.assertNotIn(
-                        torch.ops.aten.scaled_dot_product_attention.default, targets
-                    )
-                    self.assertNotIn(
-                        torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default,
-                        targets,
-                    )
-                    self.assertEqual(
-                        decomposed.module()(*example_inputs), model(*example_inputs)
-                    )
-                    if dynamic:
-                        other_inputs = inputs(4, 7, sequence_first)
-                        self.assertEqual(
-                            decomposed.module()(*other_inputs), model(*other_inputs)
-                        )
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            model = AttentionProjection(sequence_first)
+            example_inputs = inputs(3, 5, sequence_first)
+            dynamic_shapes = None
+            if dynamic:
+                shape = {
+                    0: Dim("batch", min=2),
+                    2: Dim("sequence", min=2),
+                }
+                dynamic_shapes = (shape, shape, shape)
+            ep = export(model, example_inputs, dynamic_shapes=dynamic_shapes)
+            decomposed = ep.run_decompositions()
+            targets = {
+                node.target
+                for node in decomposed.graph.nodes
+                if node.op == "call_function"
+            }
+            self.assertNotIn(
+                torch.ops.aten.scaled_dot_product_attention.default, targets
+            )
+            self.assertNotIn(
+                torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default,
+                targets,
+            )
+            self.assertNotIn(torch.ops.aten.as_strided.default, targets)
+            self.assertNotIn(torch.ops.aten.as_strided_copy.default, targets)
+            self.assertEqual(
+                decomposed.module()(*example_inputs), model(*example_inputs)
+            )
+            if dynamic:
+                other_inputs = inputs(4, 7, sequence_first)
+                self.assertEqual(
+                    decomposed.module()(*other_inputs), model(*other_inputs)
+                )
+
+    def test_cpu_flash_attention_singleton_layout(self):
+        class Attention(torch.nn.Module):
+            def forward(self, q, k, v):
+                return torch.ops.aten._scaled_dot_product_flash_attention_for_cpu(
+                    q, k, v
+                )[0]
+
+        query = torch.randn(3, 2, 1, 8).permute(1, 0, 2, 3)
+        inputs = (query, torch.randn_like(query), torch.randn_like(query))
+        model = Attention()
+        decomposed = export(model, inputs).run_decompositions()
+        expected = model(*inputs)
+        actual = decomposed.module()(*inputs)
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual.stride(), expected.stride())
+        self.assertExpectedInline(
+            decomposed.graph_module.code.strip(),
+            """\
+def forward(self, q, k, v):
+    mul_scalar = torch.ops.aten.mul.Scalar(q, 0.5946035575013605);  q = None
+    expand_default = torch.ops.aten.expand.default(v, [2, 3, 1, 8]);  v = None
+    clone_default = torch.ops.aten.clone.default(expand_default, memory_format = torch.contiguous_format);  expand_default = None
+    expand_default_1 = torch.ops.aten.expand.default(mul_scalar, [2, 3, 1, 8]);  mul_scalar = None
+    clone_default_1 = torch.ops.aten.clone.default(expand_default_1, memory_format = torch.contiguous_format);  expand_default_1 = None
+    permute_default = torch.ops.aten.permute.default(k, [0, 1, 3, 2]);  k = None
+    mul_scalar_1 = torch.ops.aten.mul.Scalar(permute_default, 0.5946035575013605);  permute_default = None
+    expand_default_2 = torch.ops.aten.expand.default(mul_scalar_1, [2, 3, 8, 1]);  mul_scalar_1 = None
+    clone_default_2 = torch.ops.aten.clone.default(expand_default_2, memory_format = torch.contiguous_format);  expand_default_2 = None
+    view_default = torch.ops.aten.view.default(clone_default, [6, 1, 8]);  clone_default = None
+    view_default_1 = torch.ops.aten.view.default(clone_default_1, [6, 1, 8]);  clone_default_1 = None
+    view_default_2 = torch.ops.aten.view.default(clone_default_2, [6, 8, 1]);  clone_default_2 = None
+    bmm_default = torch.ops.aten.bmm.default(view_default_1, view_default_2);  view_default_1 = view_default_2 = None
+    view_default_3 = torch.ops.aten.view.default(bmm_default, [2, 3, 1, 1]);  bmm_default = None
+    _softmax_default = torch.ops.aten._softmax.default(view_default_3, -1, False)
+    eq_scalar = torch.ops.aten.eq.Scalar(view_default_3, -inf);  view_default_3 = None
+    full_like_default = torch.ops.aten.full_like.default(_softmax_default, 0, pin_memory = False, memory_format = torch.preserve_format)
+    logical_not_default = torch.ops.aten.logical_not.default(eq_scalar);  eq_scalar = None
+    any_dim = torch.ops.aten.any.dim(logical_not_default, -1, True);  logical_not_default = None
+    logical_not_default_1 = torch.ops.aten.logical_not.default(any_dim);  any_dim = None
+    where_self = torch.ops.aten.where.self(logical_not_default_1, full_like_default, _softmax_default);  logical_not_default_1 = full_like_default = _softmax_default = None
+    expand_default_3 = torch.ops.aten.expand.default(where_self, [2, 3, 1, 1]);  where_self = None
+    view_default_4 = torch.ops.aten.view.default(expand_default_3, [6, 1, 1]);  expand_default_3 = None
+    bmm_default_1 = torch.ops.aten.bmm.default(view_default_4, view_default);  view_default_4 = view_default = None
+    view_default_5 = torch.ops.aten.view.default(bmm_default_1, [2, 3, 1, 8]);  bmm_default_1 = None
+    permute_default_1 = torch.ops.aten.permute.default(view_default_5, [1, 0, 2, 3]);  view_default_5 = None
+    clone_default_3 = torch.ops.aten.clone.default(permute_default_1, memory_format = torch.contiguous_format);  permute_default_1 = None
+    permute_default_2 = torch.ops.aten.permute.default(clone_default_3, [1, 0, 2, 3]);  clone_default_3 = None
+    return (permute_default_2,)""",
+        )
 
     def test_scaled_dot_product_attention_cpu(self):
         """

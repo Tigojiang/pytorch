@@ -5873,6 +5873,8 @@ def scaled_dot_product_flash_attention_for_cpu(
     attn_mask: Tensor | None = None,
     scale: float | None = None,
 ) -> tuple[Tensor, Tensor]:
+    from torch.fx.experimental.symbolic_shapes import statically_known_true
+
     torch._check(
         torch.is_floating_point(query),
         lambda: f"query must be FP32, FP64, BF16, FP16 but got {query.dtype}",
@@ -5900,28 +5902,22 @@ def scaled_dot_product_flash_attention_for_cpu(
         scale=scale,
         enable_gqa=query.size(1) != key.size(1),
     )
-    # Native CPU flash attention and its meta kernel allocate empty_like(query).
-    # Match that layout rather than always packing (L, N, H, E): MHA commonly
-    # uses that order, but BERT-style projections use (N, L, H, E). Export can
-    # elide contiguous() using the native layout, so changing strides here can
-    # invalidate an already-traced downstream view.
-    # empty_like also compacts non-dense queries instead of retaining gaps.
-    output_layout = torch.empty_like(query)
-    output_strides = output_layout.stride()
-    # Use symbolic stride ordering so unbacked batch sizes can include 0 or 1.
-    physical_order, _ = utils.compute_elementwise_output_logical_to_physical_perm(
-        output_layout
-    )
-    del output_layout
-    inverse_order = [physical_order.index(dim) for dim in range(output.ndim)]
+    # Match native empty_like(query) layout; export may elide contiguous().
+    physical_order, _ = utils.compute_elementwise_output_logical_to_physical_perm(query)
+    inverse_order = utils.invert_perm(physical_order)
     output = (
         output.permute(physical_order)
         .clone(memory_format=torch.contiguous_format)
         .permute(inverse_order)
     )
-    # The copy above arranges the values; as_strided only restores exact
-    # singleton/empty-dimension strides that a contiguous clone may normalize.
-    output = output.as_strided(output.shape, output_strides)
+    # Only zero/one dimensions may need stride restoration after the dense copy.
+    if not all(statically_known_true(size > 1) for size in query.shape):
+        output_strides = torch.empty_like(query, device="meta").stride()
+        if not all(
+            statically_known_true(actual == expected)
+            for actual, expected in zip(output.stride(), output_strides)
+        ):
+            output = output.as_strided(output.shape, output_strides)
     return output, attn
 
 

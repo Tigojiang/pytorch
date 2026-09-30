@@ -34,9 +34,11 @@ from torch.testing._internal.common_methods_invocations import op_db
 from torch.testing._internal.common_modules import module_db, modules
 from torch.testing._internal.common_utils import (
     is_iterable_of_tensors,
+    parametrize,
     run_tests,
     skipIfCrossRef,
     skipIfTorchDynamo,
+    subtest,
     suppress_warnings,
     TEST_WITH_ASAN,
     TEST_WITH_SLOW,
@@ -1440,48 +1442,58 @@ class DecompOneOffTests(TestCase):
             self.assertTrue(torch.allclose(actual_res, eager_res, atol=atol, rtol=rtol))
 
     @onlyCPU
-    def test_cpu_flash_attention_output_layout(self, device):
+    @parametrize(
+        "make_query",
+        [
+            subtest(lambda randn: randn(2, 3, 4, 8), name="contiguous"),
+            subtest(lambda randn: randn(4, 2, 3, 8).permute(1, 2, 0, 3), name="mha"),
+            subtest(lambda randn: randn(2, 4, 3, 8).transpose(1, 2), name="bert"),
+            subtest(lambda randn: randn(2, 3, 8, 8)[:, :, ::2, :], name="sliced"),
+            subtest(
+                lambda randn: randn(4, 1, 3, 8).permute(1, 2, 0, 3),
+                name="singleton_batch",
+            ),
+            subtest(
+                lambda randn: randn(2, 1, 3, 8).transpose(1, 2),
+                name="singleton_sequence",
+            ),
+            subtest(
+                lambda randn: randn(4, 0, 3, 8).permute(1, 2, 0, 3),
+                name="empty_batch",
+            ),
+        ],
+    )
+    def test_cpu_flash_attention_output_layout(self, device, make_query):
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         def randn(*shape):
             return torch.randn(*shape, device=device, dtype=torch.double)
 
-        queries = {
-            "contiguous": randn(2, 3, 4, 8),
-            "mha": randn(4, 2, 3, 8).permute(1, 2, 0, 3),
-            "bert": randn(2, 4, 3, 8).transpose(1, 2),
-            "sliced": randn(2, 3, 8, 8)[:, :, ::2, :],
-            "singleton_batch": randn(4, 1, 3, 8).permute(1, 2, 0, 3),
-            "singleton_sequence": randn(2, 1, 3, 8).transpose(1, 2),
-            "empty_batch": randn(4, 0, 3, 8).permute(1, 2, 0, 3),
-        }
+        query = make_query(randn).requires_grad_()
+        key = torch.randn_like(query, requires_grad=True)
+        value = torch.randn_like(query, requires_grad=True)
+        inputs = (query, key, value)
         decompose = (
             torch._decomp.decompositions.scaled_dot_product_flash_attention_for_cpu
         )
-        for layout, query in queries.items():
-            with self.subTest(layout=layout):
-                query.requires_grad_()
-                key = torch.randn_like(query, requires_grad=True)
-                value = torch.randn_like(query, requires_grad=True)
-                inputs = (query, key, value)
-                expected = aten._scaled_dot_product_flash_attention_for_cpu(*inputs)[0]
-                actual = decompose(*inputs)[0]
-                self.assertEqual(actual, expected)
-                self.assertEqual(actual.stride(), expected.stride())
+        expected = aten._scaled_dot_product_flash_attention_for_cpu(*inputs)[0]
+        actual = decompose(*inputs)[0]
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual.stride(), expected.stride())
 
-                with FakeTensorMode() as mode:
-                    fake_inputs = tuple(mode.from_tensor(x) for x in inputs)
-                    fake_expected = aten._scaled_dot_product_flash_attention_for_cpu(
-                        *fake_inputs
-                    )[0]
-                    fake_actual = decompose(*fake_inputs)[0]
-                self.assertEqual(fake_actual.stride(), fake_expected.stride())
+        with FakeTensorMode() as mode:
+            fake_inputs = tuple(mode.from_tensor(x) for x in inputs)
+            fake_expected = aten._scaled_dot_product_flash_attention_for_cpu(
+                *fake_inputs
+            )[0]
+            fake_actual = decompose(*fake_inputs)[0]
+        self.assertEqual(fake_actual.stride(), fake_expected.stride())
 
-                grad = torch.randn_like(expected)
-                self.assertEqual(
-                    torch.autograd.grad(actual, inputs, grad),
-                    torch.autograd.grad(expected, inputs, grad),
-                )
+        grad = torch.randn_like(expected)
+        self.assertEqual(
+            torch.autograd.grad(actual, inputs, grad),
+            torch.autograd.grad(expected, inputs, grad),
+        )
 
     @onlyCPU
     def test_cpu_flash_attention_output_layout_unbacked_batch(self, device):
@@ -1491,7 +1503,7 @@ class DecompOneOffTests(TestCase):
         shape_env = ShapeEnv()
         with FakeTensorMode(shape_env=shape_env):
             batch = shape_env.create_unbacked_symint()
-            torch._constrain_as_size(batch)
+            torch._check_is_size(batch)
             query = torch.empty(4, batch, 3, 8, device=device).permute(1, 2, 0, 3)
             inputs = (query, torch.empty_like(query), torch.empty_like(query))
             expected = aten._scaled_dot_product_flash_attention_for_cpu(*inputs)[0]
