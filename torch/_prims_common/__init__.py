@@ -263,6 +263,8 @@ def check_contiguous_sizes_strides(sizes, strides, false_if_dde=False):
     e.g. torch.empty(u0, u1, u2).contiguous().stride() -> (Max(1, u1) * Max(1, u2), Max(1, u2), 1)
     and we'd like to treat this equal to (u1 * u2, u2, 1) for comparison purposes.
     """
+    if false_if_dde:
+        return torch._C._is_contiguous_or_false(sizes, strides)
 
     from torch.fx.experimental.symbolic_shapes import (
         guard_or_false,
@@ -329,6 +331,9 @@ def is_contiguous(a: TensorLikeType, false_if_dde=False) -> bool:
 
 # This function is equivalent to compute_channels_last_contiguous_2d() in TensorImpl.cpp
 def is_channels_last_contiguous_2d(a: Tensor, false_if_dde=False) -> bool:
+    if false_if_dde:
+        return torch._C._is_channels_last_contiguous_2d_or_false(a.shape, a.stride())
+
     # NHWC or not channels last 2D contiguous
     if a.ndim != 4:
         return False
@@ -357,6 +362,9 @@ def is_channels_last_contiguous_2d(a: Tensor, false_if_dde=False) -> bool:
 
 
 def is_channels_last_contiguous_3d(a: Tensor, false_if_dde=False) -> bool:
+    if false_if_dde:
+        return torch._C._is_channels_last_contiguous_3d_or_false(a.shape, a.stride())
+
     # NDHWC or not channels last 3D contiguous
     if a.ndim != 5:
         return False
