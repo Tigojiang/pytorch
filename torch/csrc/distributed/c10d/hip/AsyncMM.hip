@@ -3,6 +3,7 @@
 #include <ATen/hip/HIPContext.h>
 #include <c10/hip/HIPGuard.h>
 #include <torch/csrc/distributed/c10d/cuda/AsyncMM.cuh>
+#include <torch/library.h>
 
 #include <limits>
 
@@ -235,8 +236,6 @@ void async_input_mm_impl(
 
 } // namespace
 
-#endif // defined(USE_ROCM_ASYNC_MM)
-
 namespace c10d::cuda::detail {
 
 at::Tensor async_input_mm_out(
@@ -286,15 +285,9 @@ at::Tensor async_input_mm_out(
       a_chunk_pivot >= 0 && a_chunk_pivot < num_chunks,
       "async_input_mm: `a_chunk_pivot` must be in [0, ", num_chunks, "), got ", a_chunk_pivot);
 
-#if defined(USE_ROCM_ASYNC_MM)
   // The CK kernel is 1.6x (gfx942) to 6x (gfx950) slower with column-major B
   // than with row-major B, which outweighs copying B to row-major.
   async_input_mm_impl(a, b.contiguous(), a_chunk_signals, a_chunk_pivot, out);
-#else
-  TORCH_CHECK(
-      false,
-      "async_input_mm: PyTorch was built without ROCm gfx942/gfx950 support for this kernel");
-#endif
   return out;
 }
 
@@ -314,3 +307,11 @@ at::Tensor async_input_mm(
 }
 
 } // namespace c10d::cuda::detail
+
+// _rocm_async_mm_is_built() in torch/distributed/_symmetric_memory checks for
+// this registration, so it stays inside the USE_ROCM_ASYNC_MM block.
+TORCH_LIBRARY_IMPL(symm_mem, CUDA, m) {
+  m.impl("_async_input_mm", c10d::cuda::detail::async_input_mm);
+}
+
+#endif // defined(USE_ROCM_ASYNC_MM)

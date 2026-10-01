@@ -692,10 +692,10 @@ if(USE_ROCM)
       append_filelist("libtorch_cuda_distributed_extra_sources" Caffe2_HIP_SRCS)
       # On ROCm the native async-TP GEMM is the CK-tile kernel in
       # hip/AsyncMM.hip instead of the CUTLASS one in cuda/AsyncMM.cu. The .hip
-      # file always provides the async_input_mm symbol the op registration
-      # needs; the kernel itself (USE_ROCM_ASYNC_MM) needs gfx942/gfx950 in
-      # PYTORCH_ROCM_ARCH and the CK headers, which ATen adds to the include
-      # path only when CK SDPA or CK GEMM is enabled.
+      # file builds and registers the kernel (USE_ROCM_ASYNC_MM) only with
+      # gfx942/gfx950 in PYTORCH_ROCM_ARCH and the CK headers, which ATen adds
+      # to the include path only when CK SDPA or CK GEMM is enabled; otherwise
+      # fused_all_gather_matmul falls back to the decomposition.
       list(REMOVE_ITEM Caffe2_HIP_SRCS
         ${TORCH_SRC_DIR}/csrc/distributed/c10d/cuda/AsyncMM.cu)
       set(ASYNC_MM_HIP_FILE "${TORCH_SRC_DIR}/csrc/distributed/c10d/hip/AsyncMM.hip")

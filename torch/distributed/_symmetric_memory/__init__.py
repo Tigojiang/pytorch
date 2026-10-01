@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import math
 import os
 import socket
@@ -1013,12 +1014,21 @@ _ROCM_ASYNC_MM_VECTOR = 8
 _ROCM_ASYNC_MM_MAX_K = 1024
 
 
+@functools.cache
+def _rocm_async_mm_is_built() -> bool:
+    # hip/AsyncMM.hip registers _async_input_mm only when its kernel is built.
+    return torch._C._dispatch_has_kernel_for_dispatch_key(
+        "symm_mem::_async_input_mm", "CUDA"
+    )
+
+
 def _rocm_supports_fused_all_gather_matmul_native(
     A_shard: torch.Tensor, B: torch.Tensor, local_M: int
 ) -> bool:
     arch = torch.cuda.get_device_properties(A_shard.device).gcnArchName.split(":")[0]
     return (
         arch in _ROCM_ASYNC_MM_ARCHS
+        and _rocm_async_mm_is_built()
         and A_shard.dtype == torch.bfloat16
         and B.dtype == torch.bfloat16
         and B.dim() == 2

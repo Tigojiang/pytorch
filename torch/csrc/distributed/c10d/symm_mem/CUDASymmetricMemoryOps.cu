@@ -1392,10 +1392,10 @@ TORCH_LIBRARY_IMPL(symm_mem, CUDA, m) {
   m.impl("two_shot_all_reduce_", ::two_shot_all_reduce_);
   m.impl("two_shot_all_reduce_out", ::two_shot_all_reduce_out);
   m.impl("reduce_scatter_out", ::reduce_scatter_out);
-
-  m.impl("_async_input_mm", c10d::cuda::detail::async_input_mm);
 #endif
 #if defined(CUDART_VERSION)
+  // On ROCm, hip/AsyncMM.hip registers this when its kernel is built.
+  m.impl("_async_input_mm", c10d::cuda::detail::async_input_mm);
   m.impl("multimem_all_reduce_", ::multimem_all_reduce_);
 
   // NOTE: [multimem_one_shot_all_reduce]
