@@ -105,11 +105,7 @@ def wrap_with_additional_external_object_state(
         for device_type, device_index, index in current_stream_indices:
             if index < prefix_count:
                 continue
-            device = (
-                torch.device(device_type)
-                if device_index is None
-                else torch.device(device_type, device_index)
-            )
+            device = torch.device(device_type, device_index)
             runtime_objects[index] = torch.accelerator.current_stream(device)
         with restore_external_object_state(
             prefix + suffix, runtime_objects, current_stream_indices

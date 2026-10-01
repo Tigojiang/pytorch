@@ -128,9 +128,7 @@ def _snapshot_external_objects(ctx: Any) -> None:
     }
     for device_type, device_index, index in current_stream_indices:
         if index not in ctx._external_objects:
-            device = torch.device(device_type)
-            if device_index is not None:
-                device = torch.device(device_type, typing.cast(int, device_index))
+            device = torch.device(device_type, device_index)
             ctx._external_objects[index] = torch.accelerator.current_stream(device)
     ctx._external_stream_indices = current_stream_indices
 

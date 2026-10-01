@@ -588,7 +588,10 @@ class DynamoBytecodeFlatten:
     @dynamo_disable(reason="do not trace internal dynamo graph capture")  # type: ignore[misc]
     def __call__(self, *inputs: object) -> object:
         def backend_dummy(*example_inputs: object) -> None:
-            self.gm_inputs = example_inputs
+            if self.out.backend_input is None:
+                raise AssertionError("backend_input must not be None")
+            graph_input_count = len(self.out.backend_input.example_inputs)
+            self.gm_inputs = example_inputs[len(example_inputs) - graph_input_count :]
             raise Yield
 
         args, kwargs = self.input_processor(inputs)
@@ -1073,6 +1076,8 @@ def _dynamo_graph_capture_for_export(
             for real_idx, graph_idx in graph_input_order.items():
                 flat_inputs[real_idx] = example_inputs[graph_idx]
 
+            # Drop unused lookups before the transformer evaluates their expired indices.
+            graph.graph.eliminate_dead_code()
             # Use FX transformer to rebuild the graph cleanly
             transformed_graph = DynamoGraphTransformer(
                 graph,
