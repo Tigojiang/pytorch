@@ -3934,8 +3934,6 @@ For now, dynamo will explicitly graph break when it encounters user code with th
                 )
                 resolved_op = getattr(packet, overload)
                 schema = resolved_op._schema
-                if isinstance(fn_, torch._ops.OpOverloadPacket):
-                    fn_ = resolved_op
             except RuntimeError:
                 pass
 
