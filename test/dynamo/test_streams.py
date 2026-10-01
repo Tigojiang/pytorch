@@ -1642,6 +1642,7 @@ class <lambda>(torch.nn.Module):
                 torch.accelerator.current_stream().wait_stream(stream)
             elif barrier == "synchronize_stream":
                 stream.synchronize()
+                event.record(stream)
             else:
                 torch.accelerator.synchronize()
             return y + 1

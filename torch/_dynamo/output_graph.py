@@ -1518,9 +1518,15 @@ class OutputGraph(OutputGraphCommon):
                 ),
                 hints=[],
             )
-        barrier.meta.setdefault("custom", {})[INPUT_MUTATION_BARRIER_INPUTS] = (
-            frozenset(mutation_inputs)
-        )
+        custom = barrier.meta.setdefault("custom", {})
+        custom[INPUT_MUTATION_BARRIER_INPUTS] = frozenset(mutation_inputs)
+        for input_name, mutations in mutation_inputs.items():
+            pending = self._input_mutation_streams[input_name]
+            matched = {id(mutation) for mutation in mutations}
+            for identity in [key for key in pending if id(pending[key]) in matched]:
+                del pending[identity]
+            if not pending:
+                del self._input_mutation_streams[input_name]
 
     _EVENT_INPUT_MUTATION_FIX = (
         "To fix this, either:\n"
