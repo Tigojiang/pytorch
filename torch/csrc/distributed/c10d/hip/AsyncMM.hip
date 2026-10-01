@@ -55,7 +55,9 @@ struct AsyncGemmConfig
     static constexpr ck_tile::index_t NumWaveGroups = 1;
     static constexpr bool Preshuffle = false;
 
-    static constexpr ck_tile::index_t TilePartitionerGroupNum = 8;
+    // Visit tiles in M order, the order chunks arrive in. With more groups,
+    // only the blocks of the last chunk's groups work on it once it arrives.
+    static constexpr ck_tile::index_t TilePartitionerGroupNum = 1;
     static constexpr ck_tile::index_t TilePartitionerM01 = 4;
     static constexpr bool PermuteA = false;
     static constexpr bool PermuteB = false;
