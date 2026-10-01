@@ -3767,15 +3767,12 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
     def test_stream_alias_registry_cache_key(self):
         self.addCleanup(reset_user_object_tracking)
 
-        def fn(x):
-            return x.sin()
-
-        def key(aliases, shift_slots=False, barrier=False):
+        def key(aliases, shift_slots=False, barrier=False, indexless=False):
             reset_user_object_tracking()
             if shift_slots:
                 unused = torch.cuda.Stream()
                 register_user_object(unused, ConstantSource("unused_stream"))
-            first = torch.cuda.Stream()
+            first = torch.cuda.current_stream() if indexless else torch.cuda.Stream()
             second = (
                 torch.cuda.ExternalStream(first.cuda_stream, device=first.device)
                 if aliases
@@ -3783,19 +3780,21 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
             )
             first_index = register_user_object(first, ConstantSource("first_stream"))
             second_index = register_user_object(second, ConstantSource("second_stream"))
-            if not barrier:
+            if indexless:
+                register_current_stream(torch.device("cuda"), first_index)
+            elif not barrier:
                 register_current_stream(first.device, second_index)
-            gm = torch.fx.experimental.proxy_tensor.make_fx(fn)(torch.ones(3))
+            gm = torch.fx.experimental.proxy_tensor.make_fx(torch.sin)(torch.ones(3))
             inputs = [torch.ones(3)]
             node = next(n for n in gm.graph.nodes if n.op == "call_function")
             node.meta.setdefault("custom", {})["stream"] = first_index
             if barrier:
                 with gm.graph.inserting_before(gm.graph.output_node()):
                     gm.graph.call_function(
-                        torch.ops.streams.synchronize_stream.default, (second_index,)
+                        torch.ops.streams.synchronize_stream.default,
+                        (first_index if indexless else second_index,),
                     )
-            shape_env = ShapeEnv()
-            ctx = TracingContext(FakeTensorMode(shape_env=shape_env))
+            ctx = TracingContext(FakeTensorMode(shape_env=ShapeEnv()))
             with torch._guards.tracing(ctx):
                 return autograd_cache_key(gm, inputs, self.default_config())
 
@@ -3804,6 +3803,11 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         self.assertNotEqual(alias, key(False))
         self.assertNotEqual(alias, key(True, shift_slots=True))
         self.assertNotEqual(key(True, barrier=True), key(False, barrier=True))
+        if torch.cuda.device_count() >= 2:
+            with torch.cuda.device(0):
+                first_key = key(True, barrier=True, indexless=True)
+            with torch.cuda.device(1):
+                self.assertEqual(first_key, key(True, barrier=True, indexless=True))
 
     def test_region_activation_memory_budget_coverage_config_cache_key(self):
         def fn(x):

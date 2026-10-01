@@ -696,7 +696,10 @@ class AOTAutogradCacheDetails(FxGraphHashDetails):
             torch.ops.streams.synchronize_stream.default: (0,),
         }
         self.stream_barrier_operands = tuple(
-            canonical_stream(cast(int, node.args[position]))
+            canonical_stream(
+                (index := cast(int, node.args[position])),
+                preserve_device=index in indexless_current_streams,
+            )
             for _, module in gm.named_modules()
             if isinstance(module, torch.fx.GraphModule)
             for node in module.graph.nodes

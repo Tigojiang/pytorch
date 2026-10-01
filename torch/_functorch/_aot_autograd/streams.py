@@ -55,13 +55,7 @@ _SYNC_OPS = (
     torch.ops.streams.synchronize_stream.default,
 )
 
-_EPILOGUE_COPY_BARRIERS = (
-    torch.ops.streams.record_event.default,
-    torch.ops.streams.wait_event.default,
-    torch.ops.streams.wait_stream.default,
-    torch.ops.streams.synchronize_device.default,
-    torch.ops.streams.synchronize_stream.default,
-)
+_EPILOGUE_COPY_BARRIERS = set(_SYNC_OPS) - {torch.ops.streams.synchronize_event.default}
 _EPILOGUE_COPY_DEPS = "epilogue_copy_deps"
 
 

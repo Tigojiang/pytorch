@@ -66,8 +66,8 @@ def assert_writeback_precedes_barrier(
 ) -> None:
     from torch._inductor.fx_passes.control_dependencies import control_deps
 
-    writebacks = list(
-        graph.find_nodes(op="call_function", target=torch.ops.aten.copy_.default)
+    writebacks = graph.find_nodes(
+        op="call_function", target=torch.ops.aten.copy_.default
     )
     if input_numel is not None:
         writebacks = [
