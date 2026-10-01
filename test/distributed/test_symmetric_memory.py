@@ -1562,6 +1562,52 @@ class AsyncTPTest(MultiProcContinuousTest):
         torch.testing.assert_close(mm_target[0], mm_baseline[0])
         os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "0"
 
+    @skipIf(not TEST_WITH_ROCM, "ROCm-only graph-capture fallback")
+    @skip_if_lt_x_gpu(2)
+    def test_fused_all_gather_matmul_native_graph_capture(self) -> None:
+        self._init_process()
+
+        M = 4096
+        N = 1024
+        K = 512
+        group_name = dist.group.WORLD.group_name
+        torch.manual_seed(42 + self.rank)
+        A_shard = torch.rand(
+            M // self.world_size, K, dtype=torch.bfloat16, device=self.device
+        )
+        B = torch.rand(K, N, dtype=torch.bfloat16, device=self.device)
+
+        ag_baseline, mm_baseline = _fused_all_gather_matmul_fallback(
+            A_shard, [B], gather_dim=0, group_name=group_name
+        )
+        # Sizes the decomposition's workspace, which cannot grow during capture.
+        os.environ.pop("TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP", None)
+        torch.ops.symm_mem.fused_all_gather_matmul(
+            A_shard, [B], gather_dim=0, group_name=group_name
+        )
+
+        os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "1"
+        self.assertTrue(
+            symm_mem._should_use_fused_all_gather_matmul_native(
+                A_shard, [B], 0, group_name
+            )
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            use_native = symm_mem._should_use_fused_all_gather_matmul_native(
+                A_shard, [B], 0, group_name
+            )
+            ag_target, mm_target = torch.ops.symm_mem.fused_all_gather_matmul(
+                A_shard, [B], gather_dim=0, group_name=group_name
+            )
+        # Checked before replay: a captured native path can deadlock on replay.
+        self.assertFalse(use_native)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(ag_target, ag_baseline)
+        torch.testing.assert_close(mm_target[0], mm_baseline[0])
+        os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "0"
+
     @skip_if_lt_x_gpu(2)
     @requires_multicast_support()
     def test_multimem_all_gather_matmul(self) -> None:

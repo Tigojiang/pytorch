@@ -1054,7 +1054,15 @@ def _should_use_fused_all_gather_matmul_native(
         and len(Bs) == 1
         and (
             torch.version.hip is None
-            or _rocm_supports_fused_all_gather_matmul_native(A_shard, Bs[0], local_M)
+            or (
+                # The async GEMM spins on chunk signals written by another branch
+                # of a captured graph, and HIP may replay those branches on a
+                # single stream, which deadlocks.
+                not torch.cuda.is_current_stream_capturing()
+                and _rocm_supports_fused_all_gather_matmul_native(
+                    A_shard, Bs[0], local_M
+                )
+            )
         )
     )
 
@@ -1134,6 +1142,10 @@ def _fused_all_gather_matmul_native_rocm(
     B: torch.Tensor,
     group_name: c10d.GroupName,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "_fused_all_gather_matmul_native does not support graph capture on ROCm"
+        )
     symm_mem = rendezvous(A_shard, group_name)
     if symm_mem is None:
         symm_mem = get_symm_mem_workspace(
@@ -1164,10 +1176,7 @@ def _fused_all_gather_matmul_native_rocm(
     current_stream.wait_stream(backend_stream)
 
     _rocm_copy_in_pieces(A_shards[rank], A_shard)
-    if not torch.cuda.is_current_stream_capturing():
-        _SymmetricMemory.stream_write_value32(A_signals, rank, 1)
-    else:
-        _SymmetricMemory.memset32(A_signals, offset=rank, val=1, count=1)
+    _SymmetricMemory.stream_write_value32(A_signals, rank, 1)
 
     out = torch.ops.symm_mem._async_input_mm(A, B, A_signals, rank)
     for step in range(1, world_size):
@@ -1175,10 +1184,7 @@ def _fused_all_gather_matmul_native_rocm(
         src_buf = symm_mem.get_buffer(src_rank, A_shard.shape, A_shard.dtype)
         with backend_stream:
             _rocm_copy_in_pieces(A_shards[src_rank], src_buf)
-            if not torch.cuda.is_current_stream_capturing():
-                _SymmetricMemory.stream_write_value32(A_signals, src_rank, 1)
-            else:
-                _SymmetricMemory.memset32(A_signals, offset=src_rank, val=1, count=1)
+            _SymmetricMemory.stream_write_value32(A_signals, src_rank, 1)
 
     # backend_stream is not re-ordered after current_stream here: every user of
     # the backend stream does that at entry before issuing work on it.
