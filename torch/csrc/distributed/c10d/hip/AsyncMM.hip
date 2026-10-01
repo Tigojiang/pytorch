@@ -215,11 +215,13 @@ void async_input_mm_impl(
   // The host path copies chunks in pieces of at most 1 MiB, which HIP runs as
   // shader kernels spread over every shader engine. Keep one CU per shader
   // engine out of the persistent grid, or blocks spinning on unsignaled chunks
-  // can starve those copies and deadlock.
-  const int gemm_cus = std::max(
-      at::cuda::getCurrentDeviceProperties()->multiProcessorCount -
-          num_xcc * kShaderEnginesPerXcc,
-      1);
+  // can starve those copies and deadlock. Count CUs per engine rounded down:
+  // MI300X's 38 CUs per XCC do not split evenly over 4 engines, and reserving
+  // one CU per engine from the total still deadlocks there.
+  const int num_se = num_xcc * kShaderEnginesPerXcc;
+  const int cus_per_se =
+      at::cuda::getCurrentDeviceProperties()->multiProcessorCount / num_se;
+  const int gemm_cus = std::max((cus_per_se - 1) * num_se, 1);
   const int max_grid = gemm_cus * std::max(occupancy, 1);
   const dim3 grids(std::min<int>(TilePartitioner::GridSize(M, N), max_grid));
 

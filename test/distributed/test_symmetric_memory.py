@@ -1608,6 +1608,39 @@ class AsyncTPTest(MultiProcContinuousTest):
         torch.testing.assert_close(mm_target[0], mm_baseline[0])
         os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "0"
 
+    @skipIf(not TEST_WITH_ROCM, "ROCm-only persistent grid sizing")
+    @skip_if_lt_x_gpu(2)
+    def test_fused_all_gather_matmul_native_more_tiles_than_grid(self) -> None:
+        os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "1"
+        self._init_process()
+
+        # 16 x 32 output tiles of 256 x 256 is more than the persistent grid on
+        # gfx942 and gfx950, so the peer copies run while the grid is full.
+        M = 4096
+        N = 8192
+        K = 512
+        group_name = dist.group.WORLD.group_name
+        torch.manual_seed(42 + self.rank)
+        A_shard = torch.rand(
+            M // self.world_size, K, dtype=torch.bfloat16, device=self.device
+        )
+        B = torch.rand(K, N, dtype=torch.bfloat16, device=self.device)
+        self.assertTrue(
+            symm_mem._should_use_fused_all_gather_matmul_native(
+                A_shard, [B], 0, group_name
+            )
+        )
+
+        ag_baseline, mm_baseline = _fused_all_gather_matmul_fallback(
+            A_shard, [B], gather_dim=0, group_name=group_name
+        )
+        ag_target, mm_target = torch.ops.symm_mem.fused_all_gather_matmul(
+            A_shard, [B], gather_dim=0, group_name=group_name
+        )
+        torch.testing.assert_close(ag_target, ag_baseline)
+        torch.testing.assert_close(mm_target[0], mm_baseline[0])
+        os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "0"
+
     @skipIf(
         not SM90OrLater,
         "_fused_all_gather_matmul_native currently only supports sm>=90",
