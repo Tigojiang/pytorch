@@ -220,7 +220,7 @@ def _fake_tensors_overlap(first: Any, second: Any) -> bool:
     if not (
         is_fake_tensor(first)
         and is_fake_tensor(second)
-        and torch._C._is_alias_of(first, second)
+        and torch._C._is_alias_of(first, second)  # pyrefly: ignore [missing-attribute]
     ):
         return False
     symbolic = any(
@@ -1450,7 +1450,7 @@ class OutputGraph(OutputGraphCommon):
             }
             sources = [stream.source for stream in streams]
             for input_name, input_mutations in self._input_mutation_streams.items():
-                matched_mutations = []
+                matched_mutations: list[InputMutation] = []
                 for identity, mutation in input_mutations.items():
                     mutation_sources = mutation[1]
                     sources.extend(mutation_sources)
@@ -1480,7 +1480,9 @@ class OutputGraph(OutputGraphCommon):
                         or (
                             device.index is None
                             and _coor_device_index_is_current(
-                                torch.device(*identity[:2])
+                                torch.device(identity[0])
+                                if identity[1] is None
+                                else torch.device(identity[0], identity[1])
                             )
                         )
                     )
