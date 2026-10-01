@@ -1186,8 +1186,9 @@ def _fused_all_gather_matmul_native_rocm(
     A_shards = A.chunk(world_size)
 
     symm_mem.barrier()
+    # Only the native AsyncTP ops use this backend stream, and each ends by
+    # ordering current_stream after it, so current_stream needs no wait here.
     backend_stream.wait_stream(current_stream)
-    current_stream.wait_stream(backend_stream)
 
     _rocm_copy_in_pieces(A_shards[rank], A_shard)
     _SymmetricMemory.stream_write_value32(A_signals, rank, 1)
