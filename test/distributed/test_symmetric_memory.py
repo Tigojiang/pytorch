@@ -3354,6 +3354,89 @@ class SymmMemSingleProcTest(TestCase):
         finally:
             dist.destroy_process_group()
 
+    @requires_cuda
+    @skipIf(not TEST_WITH_ROCM, "ROCm-only native AsyncTP kernel")
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    def test_async_input_mm_rocm(self):
+        if not symm_mem._rocm_async_mm_is_built():
+            self.skipTest("the native AsyncTP kernel is not built")
+        torch.manual_seed(0)
+        # The kernel spins until each chunk's signal is 1, so all are set upfront.
+        signals = torch.ones(4, dtype=torch.uint32, device="cuda")
+        # N=1000 and K=200 are not multiples of the kernel's 256-wide N and
+        # 32-wide K tiles.
+        for N, K in ((1024, 512), (1000, 200)):
+            a = torch.rand(1024, K, dtype=torch.bfloat16, device="cuda")
+            b = torch.rand(K, N, dtype=torch.bfloat16, device="cuda")
+            expected = a @ b
+            for b_in, pivot in itertools.product((b, b.t().contiguous().t()), (0, 3)):
+                with self.subTest(
+                    N=N, K=K, b_row_major=b_in.is_contiguous(), pivot=pivot
+                ):
+                    out = torch.ops.symm_mem._async_input_mm(a, b_in, signals, pivot)
+                    torch.testing.assert_close(out, expected)
+
+    @requires_cuda
+    @skipIf(not TEST_WITH_ROCM, "ROCm-only native AsyncTP kernel")
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    def test_async_input_mm_rocm_input_checks(self):
+        if not symm_mem._rocm_async_mm_is_built():
+            self.skipTest("the native AsyncTP kernel is not built")
+        a = torch.rand(1024, 512, dtype=torch.bfloat16, device="cuda")
+        b = torch.rand(512, 256, dtype=torch.bfloat16, device="cuda")
+
+        def signals(n, dtype=torch.uint32):
+            return torch.ones(n, dtype=dtype, device="cuda")
+
+        mm = torch.ops.symm_mem._async_input_mm
+        with self.assertRaisesRegex(RuntimeError, "`a_chunk_signals` must be"):
+            mm(a, b, signals(4, torch.int32), 0)
+        with self.assertRaisesRegex(RuntimeError, "`a_chunk_pivot` must be in"):
+            mm(a, b, signals(4), 4)
+        with self.assertRaisesRegex(RuntimeError, "must be an integer multiple"):
+            mm(a, b, signals(3), 0)
+        with self.assertRaisesRegex(RuntimeError, "must be a multiple of 256"):
+            mm(a, b, signals(8), 0)
+
+    @requires_cuda
+    @skipIf(not TEST_WITH_ROCM, "ROCm-only native AsyncTP selector")
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    def test_rocm_supports_fused_all_gather_matmul_native(self):
+        def supports(M=1024, K=512, dtype=torch.bfloat16, b_step=1):
+            A_shard = torch.rand(M, K, dtype=dtype, device="cuda")
+            B = torch.rand(K, 1024 * b_step, dtype=dtype, device="cuda")[:, ::b_step]
+            return symm_mem._rocm_supports_fused_all_gather_matmul_native(A_shard, B, M)
+
+        max_k = symm_mem._ROCM_ASYNC_MM_MAX_K
+        with mock.patch.object(symm_mem, "_rocm_async_mm_is_built", return_value=True):
+            self.assertTrue(supports())
+            self.assertTrue(supports(K=max_k - 8))
+            self.assertFalse(supports(K=max_k))
+            self.assertFalse(supports(M=1000))
+            self.assertFalse(supports(dtype=torch.float16))
+            self.assertFalse(supports(b_step=2))
+        with mock.patch.object(symm_mem, "_rocm_async_mm_is_built", return_value=False):
+            self.assertFalse(supports())
+
+    @requires_cuda
+    @skipIf(not TEST_WITH_ROCM, "ROCm-only native AsyncTP")
+    @skipIf(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
+    )
+    def test_fused_all_gather_matmul_native_rocm_rejects_capture(self):
+        A_shard = torch.rand(1024, 512, dtype=torch.bfloat16, device="cuda")
+        B = torch.rand(512, 1024, dtype=torch.bfloat16, device="cuda")
+        graph = torch.cuda.CUDAGraph()
+        with self.assertRaisesRegex(RuntimeError, "does not support graph capture"):
+            with torch.cuda.graph(graph):
+                symm_mem._fused_all_gather_matmul_native_rocm(A_shard, B, "0")
+
 
 @instantiate_parametrized_tests
 @requires_cuda_p2p_access()
