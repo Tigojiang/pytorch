@@ -1137,6 +1137,19 @@ def _rocm_copy_in_pieces(dst: torch.Tensor, src: torch.Tensor) -> None:
         d.copy_(s)
 
 
+# Reused across calls: wait_stream() creates an event per call, which costs the
+# host-bound eager path several microseconds.
+_rocm_backend_stream_event: torch.cuda.Event | None = None
+
+
+def _rocm_wait_for_backend_stream(stream: torch.cuda.Stream) -> None:
+    global _rocm_backend_stream_event
+    if _rocm_backend_stream_event is None:
+        _rocm_backend_stream_event = torch.cuda.Event()
+    _rocm_backend_stream_event.record(_get_backend_stream())
+    stream.wait_event(_rocm_backend_stream_event)
+
+
 def _fused_all_gather_matmul_native_rocm(
     A_shard: torch.Tensor,
     B: torch.Tensor,
@@ -1146,6 +1159,7 @@ def _fused_all_gather_matmul_native_rocm(
         raise RuntimeError(
             "_fused_all_gather_matmul_native does not support graph capture on ROCm"
         )
+    current_stream = torch.cuda.current_stream()
     symm_mem = rendezvous(A_shard, group_name)
     if symm_mem is None:
         symm_mem = get_symm_mem_workspace(
@@ -1153,8 +1167,9 @@ def _fused_all_gather_matmul_native_rocm(
         )
         # No barrier before overwriting this rank's workspace: ops that access
         # peers' workspace end with a symm_mem.barrier() after those accesses.
-        # The low-contention ops issue theirs on a side stream, so their results
-        # must be waited on before the group is used again.
+        # The low-contention ops issue theirs on the backend stream, so order
+        # the overwrite after it.
+        _rocm_wait_for_backend_stream(current_stream)
         buf = symm_mem.get_buffer(symm_mem.rank, A_shard.shape, A_shard.dtype)
         _rocm_copy_in_pieces(buf, A_shard)
         A_shard = buf
@@ -1162,7 +1177,6 @@ def _fused_all_gather_matmul_native_rocm(
     rank = symm_mem.rank
     world_size = symm_mem.world_size
 
-    current_stream = torch.cuda.current_stream()
     backend_stream = _get_backend_stream(priority=-1)
 
     # A_signals is zeroed on current_stream and set on backend_stream, so it is

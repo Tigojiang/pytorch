@@ -1608,6 +1608,50 @@ class AsyncTPTest(MultiProcContinuousTest):
         torch.testing.assert_close(mm_target[0], mm_baseline[0])
         os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "0"
 
+    @skipIf(
+        not SM90OrLater,
+        "_fused_all_gather_matmul_native currently only supports sm>=90",
+    )
+    @skip_if_lt_x_gpu(2)
+    @skipIf(
+        SM100OrLater,
+        "https://github.com/pytorch/pytorch/issues/162917",
+    )
+    def test_fused_all_gather_matmul_native_after_low_contention(self) -> None:
+        os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "1"
+        self._init_process()
+
+        M = 4096
+        N = 1024
+        K = 512 if TEST_WITH_ROCM else 1024
+        group_name = dist.group.WORLD.group_name
+        shape = (M // self.world_size, K)
+        x = torch.full(shape, self.rank + 1, dtype=torch.bfloat16, device=self.device)
+        A_shard = x + 99
+        B = torch.rand(K, N, dtype=torch.bfloat16, device=self.device)
+        self.assertTrue(
+            symm_mem._should_use_fused_all_gather_matmul_native(
+                A_shard, [B], 0, group_name
+            )
+        )
+
+        # Both ops stage their non-symm-mem input through the group's workspace.
+        # Rank 0's backend stream is delayed so that its all-gather reads the
+        # peers' workspaces after they have started the native op.
+        if self.rank == 0:
+            with symm_mem._get_backend_stream():
+                torch.cuda._sleep(int(20 * get_cycles_per_ms()))
+        ag = torch.ops.symm_mem._low_contention_all_gather(x, group_name)
+        ag_target, _ = torch.ops.symm_mem.fused_all_gather_matmul(
+            A_shard, [B], gather_dim=0, group_name=group_name
+        )
+        ag = torch.ops._c10d_functional.wait_tensor(ag)
+
+        for r in range(self.world_size):
+            self.assertTrue(ag.chunk(self.world_size)[r].eq(r + 1).all())
+            self.assertTrue(ag_target.chunk(self.world_size)[r].eq(r + 100).all())
+        os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "0"
+
     @skip_if_lt_x_gpu(2)
     @requires_multicast_support()
     def test_multimem_all_gather_matmul(self) -> None:
