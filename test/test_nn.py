@@ -49,7 +49,7 @@ from torch.testing._internal.common_nn import NNTestCase, NewModuleTest, Criteri
     ctcloss_reference, get_new_module_tests, single_batch_reference_fn, _test_bfloat16_ops, _test_module_empty_input
 from torch.testing._internal.common_device_type import dtypesIfMPS, instantiate_device_type_tests, dtypes, \
     dtypesIfCUDA, precisionOverride, onlyAccelerator, \
-    skipCUDAIf, skipCUDAIfNoCudnn, skipMPSIf, skipMPS, \
+    onlyCUDA, skipCUDAIf, skipCUDAIfNoCudnn, skipMPSIf, skipMPS, \
     onlyNativeDeviceTypes, deviceCountAtLeast, largeTensorTest, expectedFailureMeta, \
     expectedFailureMPS, skipMeta, get_all_device_types, skipCUDAIfNoSparseGeneric
 from torch.testing._internal.common_modules import module_inputs_torch_nn_LinearCrossEntropyLoss
@@ -7668,6 +7668,88 @@ class TestNNDeviceType(NNTestCase):
 
         if self.device_type == 'cuda':
             self._test_InstanceNorm_cuda_half(nn.InstanceNorm3d, input, device)
+
+    @onlyCUDA
+    @dtypes(torch.float, torch.half, torch.bfloat16)
+    @parametrize_test("affine", [False, True])
+    @parametrize_test("track_running_stats", [False, True])
+    @parametrize_test("training", [False, True])
+    def test_InstanceNorm3d_channels_last(
+        self, device, dtype, affine, track_running_stats, training
+    ):
+        shape = (2, 4, 3, 5, 7)
+        input_ref = torch.randn(shape, device=device, dtype=dtype, requires_grad=True)
+        input = input_ref.detach().clone(memory_format=torch.channels_last_3d).requires_grad_()
+        module_ref = nn.InstanceNorm3d(
+            shape[1], affine=affine, track_running_stats=track_running_stats
+        ).to(device=device, dtype=dtype)
+        module = deepcopy(module_ref)
+        module_ref.train(training)
+        module.train(training)
+
+        output_ref = module_ref(input_ref)
+        output = module(input)
+
+        self.assertTrue(output.is_contiguous(memory_format=torch.channels_last_3d))
+        # GroupNorm and folded BatchNorm use different reduction kernels. Allow
+        # one FP16 quantization step when comparing the equivalent paths.
+        fp16_tolerance = {"atol": 5e-4, "rtol": 0} if dtype == torch.half else {}
+        self.assertEqual(output, output_ref, **fp16_tolerance)
+        if track_running_stats:
+            self.assertEqual(module.running_mean, module_ref.running_mean)
+            self.assertEqual(module.running_var, module_ref.running_var)
+
+        grad_output = torch.randn_like(output)
+        grad_inputs = (input,)
+        grad_inputs_ref = (input_ref,)
+        if affine:
+            grad_inputs += (module.weight, module.bias)
+            grad_inputs_ref += (module_ref.weight, module_ref.bias)
+        grads = torch.autograd.grad(output, grad_inputs, grad_output)
+        grads_ref = torch.autograd.grad(
+            output_ref,
+            grad_inputs_ref,
+            grad_output.contiguous(),
+        )
+        self.assertTrue(grads[0].is_contiguous(memory_format=torch.channels_last_3d))
+        self.assertEqual(grads, grads_ref, **fp16_tolerance)
+
+    @onlyCUDA
+    @dtypes(torch.half, torch.bfloat16)
+    @parametrize_test("training", [False, True])
+    def test_InstanceNorm3d_channels_last_mixed_dtype(
+        self, device, dtype, training
+    ):
+        shape = (2, 4, 3, 5, 7)
+        input_ref = torch.randn(shape, device=device, dtype=dtype, requires_grad=True)
+        input = input_ref.detach().clone(memory_format=torch.channels_last_3d).requires_grad_()
+        module_ref = nn.InstanceNorm3d(
+            shape[1], affine=True, track_running_stats=True
+        ).to(device=device, dtype=torch.float)
+        module = deepcopy(module_ref)
+        module_ref.train(training)
+        module.train(training)
+
+        output_ref = module_ref(input_ref)
+        output = module(input)
+
+        self.assertEqual(output.dtype, dtype)
+        self.assertTrue(output.is_contiguous(memory_format=torch.channels_last_3d))
+        self.assertEqual(output, output_ref)
+        self.assertEqual(module.running_mean, module_ref.running_mean)
+        self.assertEqual(module.running_var, module_ref.running_var)
+
+        grad_output = torch.randn_like(output)
+        grads = torch.autograd.grad(
+            output, (input, module.weight, module.bias), grad_output
+        )
+        grads_ref = torch.autograd.grad(
+            output_ref,
+            (input_ref, module_ref.weight, module_ref.bias),
+            grad_output.contiguous(),
+        )
+        self.assertTrue(grads[0].is_contiguous(memory_format=torch.channels_last_3d))
+        self.assertEqual(grads, grads_ref)
 
     @parametrize_test("instance_norm_cls", [nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d], name_fn=lambda c: c.__name__)
     @parametrize_test("no_batch_dim", [True, False])
