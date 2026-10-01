@@ -1664,15 +1664,6 @@ bool tensors_definitely_do_not_overlap(const Tensor& x, const Tensor& y) {
         //     y: size=(4, 4), stride=(8, 1), offset=3
         return false;
       }
-      auto x_total_elems_covered =
-          Meta::stride(x, 0) * (Meta::size(x, 0) - 1) + Meta::size(x, 1);
-      if (x_total_elems_covered <= offset_delta) {
-        // definitely does not overlap (last byte of x is before start of y)
-        // Example:
-        //   x: size=(4, 4), stride=(8, 1), offset=0 (last byte is 27)
-        //   y: size=(4, 4), stride=(8, 1), offset=28 (start byte is 28)
-        return true;
-      }
       // At this point, we want to check if the 0th row of y
       // overlaps with **some** row of x.
       // We can check this by shifting y backward by the shared stride,

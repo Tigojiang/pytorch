@@ -120,13 +120,8 @@ def wrap_with_additional_external_object_state(
 
 
 def snapshot_current_stream_indices() -> tuple[tuple[str, int | None, int], ...]:
-    return tuple(
-        (device_type, device_index, index)
-        for (
-            device_type,
-            device_index,
-        ), index in _registry.current_stream_indices.items()
-    )
+    entries = _registry.current_stream_indices.items()
+    return tuple((*device, index) for device, index in entries)
 
 
 def snapshot_external_object_state() -> tuple[
@@ -140,12 +135,8 @@ def store_current_stream_indices(
     current_stream_indices: tuple[tuple[str, int | None, int], ...],
 ) -> None:
     _registry.current_stream_indices.clear()
-    _registry.current_stream_indices.update(
-        {
-            (device_type, device_index): index
-            for device_type, device_index, index in current_stream_indices
-        }
-    )
+    for device_type, device_index, index in current_stream_indices:
+        _registry.current_stream_indices[(device_type, device_index)] = index
 
 
 @contextmanager
