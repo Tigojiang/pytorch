@@ -10,7 +10,7 @@ import sys
 import tempfile
 import textwrap
 from contextlib import contextmanager, nullcontext
-from unittest import skipIf, skipUnless
+from unittest import mock, skipIf, skipUnless
 
 import torch
 import torch.distributed as dist
@@ -1509,10 +1509,10 @@ class AsyncTPTest(MultiProcContinuousTest):
         SM100OrLater,
         "https://github.com/pytorch/pytorch/issues/162917",
     )
+    @mock.patch.dict(os.environ, {"TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP": "1"})
     def test_fused_all_gather_matmul_native(
         self, symm_mem_input: bool, is_b_row_major: bool
     ) -> None:
-        os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "1"
         self._init_process()
 
         # See _should_use_fused_all_gather_matmul_native() for the algo
@@ -1560,10 +1560,10 @@ class AsyncTPTest(MultiProcContinuousTest):
 
         torch.testing.assert_close(ag_target, ag_baseline)
         torch.testing.assert_close(mm_target[0], mm_baseline[0])
-        os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "0"
 
     @skipIf(not TEST_WITH_ROCM, "ROCm-only graph-capture fallback")
     @skip_if_lt_x_gpu(2)
+    @mock.patch.dict(os.environ)
     def test_fused_all_gather_matmul_native_graph_capture(self) -> None:
         self._init_process()
 
@@ -1606,12 +1606,11 @@ class AsyncTPTest(MultiProcContinuousTest):
         torch.cuda.synchronize()
         torch.testing.assert_close(ag_target, ag_baseline)
         torch.testing.assert_close(mm_target[0], mm_baseline[0])
-        os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "0"
 
     @skipIf(not TEST_WITH_ROCM, "ROCm-only persistent grid sizing")
     @skip_if_lt_x_gpu(2)
+    @mock.patch.dict(os.environ, {"TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP": "1"})
     def test_fused_all_gather_matmul_native_more_tiles_than_grid(self) -> None:
-        os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "1"
         self._init_process()
 
         # 16 x 32 output tiles of 256 x 256 is more than the persistent grid on
@@ -1639,7 +1638,6 @@ class AsyncTPTest(MultiProcContinuousTest):
         )
         torch.testing.assert_close(ag_target, ag_baseline)
         torch.testing.assert_close(mm_target[0], mm_baseline[0])
-        os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "0"
 
     @skipIf(
         not SM90OrLater,
@@ -1650,8 +1648,8 @@ class AsyncTPTest(MultiProcContinuousTest):
         SM100OrLater,
         "https://github.com/pytorch/pytorch/issues/162917",
     )
+    @mock.patch.dict(os.environ, {"TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP": "1"})
     def test_fused_all_gather_matmul_native_after_low_contention(self) -> None:
-        os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "1"
         self._init_process()
 
         M = 4096
@@ -1683,7 +1681,6 @@ class AsyncTPTest(MultiProcContinuousTest):
         for r in range(self.world_size):
             self.assertTrue(ag.chunk(self.world_size)[r].eq(r + 1).all())
             self.assertTrue(ag_target.chunk(self.world_size)[r].eq(r + 100).all())
-        os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "0"
 
     @skip_if_lt_x_gpu(2)
     @requires_multicast_support()
