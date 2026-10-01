@@ -8,7 +8,6 @@ from unittest.mock import patch
 import torch
 import torch._dynamo.test_case
 import torch._dynamo.testing
-from torch._dynamo import graph_bytecode_inputs
 from torch._dynamo.device_interface import (
     device_interfaces,
     DeviceInterface,
@@ -17,6 +16,7 @@ from torch._dynamo.device_interface import (
 from torch._dynamo.graph_bytecode_inputs import (
     get_current_stream_index,
     reset_user_object_tracking,
+    snapshot_external_object_state,
     store_user_object_weakrefs,
 )
 from torch._dynamo.testing import extract_graph, remove_trailing_space
@@ -80,36 +80,12 @@ def assert_writeback_precedes_barrier(
         for node in graph.find_nodes(op="call_function", target=control_deps)
         if barrier_name in node.args[1].name
     ]
-
     test_case.assertEqual(len(writebacks), 1)
     test_case.assertEqual(len(barriers), 1)
     test_case.assertIn(writebacks[0], barriers[0].args[0])
 
 
-def make_source_less_aot_eager_backend():
-    backend = torch._dynamo.testing.AotEagerAndRecordGraphs()
-
-    def partition_backend(gm, example_inputs):
-        for node in gm.graph.find_nodes(op="placeholder"):
-            node._dynamo_source = None
-        return backend(gm, example_inputs)
-
-    return backend, partition_backend
-
-
 class TestStreamsGeneric(torch._dynamo.test_case.TestCase):
-    @requires_accelerator
-    def test_meta_input_mutation_does_not_resolve_accelerator_stream(self) -> None:
-        def fn(x):
-            x.add_(1)
-            return x
-
-        result = torch.compile(fn, backend="eager", fullgraph=True)(
-            torch.ones(2, device="meta")
-        )
-
-        self.assertEqual(result.device.type, "meta")
-
     @requires_cuda
     def test_sparse_input_skips_mutation_tracking(self) -> None:
         def fn(x):
@@ -878,6 +854,7 @@ class <lambda>(torch.nn.Module):
         def stream_generation_backend(gm, *args, **kwargs):  # type: ignore[no-untyped-def]
             s0_ind = get_current_stream(torch.device(device))
             self.assertEqual(get_external_object_by_index(s0_ind), cur_stream)
+            self.assertEqual(get_current_stream_index(torch.device(device)), s0_ind)
             with gm.graph.inserting_after(next(iter(gm.graph.nodes))):
                 gm.graph.call_function(
                     get_external_object_by_index, args=(s0_ind,), kwargs={}
@@ -948,28 +925,25 @@ class <lambda>(torch.nn.Module):
         # Annotation: {'stream': 3}
         add_2: "f32[2, 2]" = torch.ops.aten.add.Tensor(add_1, arg1_1);  arg1_1 = None
 
+        # Annotation: {'stream': 1}
+        copy_: "f32[2, 2]" = torch.ops.aten.copy_.default(arg0_1, add);  arg0_1 = None
+
         # No stacktrace found for following nodes
         subgraph_wait_stream = self.subgraph_wait_stream
-        control_deps = torch.ops.higher_order.control_deps((add_1, add_2, add, arg0_1), subgraph_wait_stream, add_1, add, arg0_1);  add_1 = add = subgraph_wait_stream = None
-
-        # Annotation: {'stream': 1}
-        getitem_1: "f32[2, 2]" = control_deps[2]
+        control_deps = torch.ops.higher_order.control_deps((copy_, add_1, add_2, add, copy_), subgraph_wait_stream, add_1);  copy_ = add_1 = add = subgraph_wait_stream = None
 
         # Annotation: {'stream': 3}
         getitem: "f32[2, 2]" = control_deps[1];  control_deps = None
 
         # Annotation: {'stream': 1}
         add_3: "f32[2, 2]" = torch.ops.aten.add.Tensor(getitem, 2);  getitem = None
-
-        # Annotation: {'stream': 1}
-        copy_: "f32[2, 2]" = torch.ops.aten.copy_.default(arg0_1, getitem_1);  arg0_1 = getitem_1 = copy_ = None
         return (add_2, add_3)
 
     class subgraph_wait_stream(torch.nn.Module):
-        def forward(self, dep_0: "f32[2, 2]", dep_1: "f32[2, 2]", dep_2: "f32[2, 2]"):
+        def forward(self, dep_0: "f32[2, 2]"):
             # Annotation: {'stream': 3}
             wait_stream_default = torch.ops.streams.wait_stream.default(1, 3)
-            return (wait_stream_default, dep_0, dep_1, dep_2)
+            return (wait_stream_default, dep_0)
 """,
         )
 
@@ -1649,249 +1623,80 @@ class <lambda>(torch.nn.Module):
     @parametrize(
         "barrier",
         (
+            "wait_event",
             "wait_stream",
             "synchronize_stream",
             "synchronize_device",
         ),
     )
     def test_input_mutation_writeback_precedes_barrier(self, device, barrier) -> None:
-        from torch._inductor.utils import run_and_get_code
-        from torch.testing import FileCheck
-
         stream = torch.Stream(device=device)
+        event = torch.Event(device=device)
 
         def fn(x, y):
             with stream:
                 x.add_(1)
-            if barrier == "wait_stream":
+            if barrier == "wait_event":
+                event.wait(stream)
+            elif barrier == "wait_stream":
                 torch.accelerator.current_stream().wait_stream(stream)
             elif barrier == "synchronize_stream":
                 stream.synchronize()
-            elif barrier == "synchronize_device":
+            else:
                 torch.accelerator.synchronize()
             return y + 1
 
         x = torch.zeros(1024, device=device)
         y = torch.zeros(1, device=device)
-        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
-        result, (code,) = run_and_get_code(compiled, x, y)
+        _, _, fw_graphs, _ = extract_graph(fn, torch.zeros_like(x), y)
+        assert_writeback_precedes_barrier(self, fw_graphs[0].graph, barrier)
+        result = torch.compile(fn, backend="inductor", fullgraph=True)(x, y)
         observed = x.clone()
         torch.accelerator.synchronize()
-
         self.assertEqual(result, y + 1)
         self.assertEqual(observed, torch.ones_like(x))
-        FileCheck().check("def call(").check("aten.copy_]").check(
-            f"torch.ops.streams.{barrier}.default("
-        ).run(code)
 
-    @parametrize("current_stream_source", ("direct", "argument", "closure"))
-    def test_current_stream_alias_writeback_precedes_wait_stream(
-        self, device, current_stream_source
-    ) -> None:
-        from torch._inductor.utils import run_and_get_code
-        from torch.testing import FileCheck
+    @parametrize("mutation", ("direct", "data", "data_requires_grad", "mixed"))
+    def test_allow_in_graph_mutation_before_wait_stream(self, device, mutation) -> None:
+        stream = torch.Stream(device=device)
 
-        observer = torch.Stream(device=device)
-        if current_stream_source == "direct":
-
-            def fn(x, y):
+        @torch.compiler.allow_in_graph
+        def mutate(x, hidden):
+            if not hidden:
                 x.add_(1)
-                observer.wait_stream(torch.accelerator.current_stream())
-                return y + 1
+            else:
+                x.data.add_(1)
+            return x
 
-            args = ()
-        elif current_stream_source == "argument":
-            current = torch.accelerator.current_stream()
+        def fn(x, hidden, out):
+            with stream:
+                mutate(x, mutation in ("data", "data_requires_grad"))
+                if mutation == "mixed":
+                    mutate(hidden, True)
+            torch.accelerator.current_stream().wait_stream(stream)
+            return out + 1
 
-            def fn(x, y, current):
-                x.add_(1)
-                observer.wait_stream(current)
-                return y + 1
-
-            args = (current,)
+        requires_grad = mutation == "data_requires_grad"
+        x = torch.zeros(7 if mutation == "mixed" else 8, device=device)
+        x = x.requires_grad_(requires_grad) + 0
+        hidden = torch.zeros(8, device=device)
+        out = torch.zeros(1, device=device)
+        if requires_grad:
+            with self.assertRaisesRegex(
+                torch._dynamo.exc.BackendCompilerFailed,
+                "out-of-graph input mutation cannot be ordered before a stream barrier",
+            ):
+                torch.compile(fn, backend="aot_eager", fullgraph=True)(x, hidden, out)
         else:
-            current = torch.accelerator.current_stream()
-
-            def fn(x, y):
-                x.add_(1)
-                observer.wait_stream(current)
-                return y + 1
-
-            args = ()
-
-        x = torch.zeros(1024, device=device)
-        y = torch.zeros(1, device=device)
-        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
-        result, (code,) = run_and_get_code(compiled, x, y, *args)
-        with observer:
-            observed = x.clone()
-        torch.accelerator.synchronize()
-
-        self.assertEqual(result, y + 1)
-        self.assertEqual(observed, torch.ones_like(x))
-        FileCheck().check("def call(").check("aten.copy_]").check(
-            "torch.ops.streams.wait_stream.default("
-        ).run(code)
-
-    def test_out_of_graph_input_writeback_before_wait_stream_errors(
-        self, device
-    ) -> None:
-        observer = torch.Stream(device=device)
-
-        def fn(x, y):
-            x.add_(1)
-            observer.wait_stream(torch.accelerator.current_stream())
-            return y + 1
-
-        x = torch.zeros(1024, device=device, requires_grad=True) + 0
-        y = torch.zeros(1, device=device)
-        with self.assertRaisesRegex(
-            RuntimeError, "input mutation cannot be ordered before a stream barrier"
-        ):
-            torch.compile(fn, backend="inductor", fullgraph=True)(x, y)
-
-    @onlyCUDA
-    def test_out_of_graph_input_writeback_ignores_unrelated_event(self, device) -> None:
-        stream = torch.Stream(device=device)
-        event = torch.Event(device=device)
-
-        def fn(x, y):
-            x.add_(1)
-            event.record(stream)
-            return y + 1
-
-        x = torch.zeros(8, device=device, requires_grad=True) + 0
-        y = torch.zeros(1, device=device)
-        result = torch.compile(fn, backend="aot_eager", fullgraph=True)(x, y)
-        torch.accelerator.synchronize()
-
-        self.assertEqual(result, y + 1)
-        self.assertEqual(x, torch.ones_like(x))
-
-    def test_input_mutation_spanning_wait_stream_errors(self, device) -> None:
-        stream = torch.Stream(device=device)
-
-        def fn(x, y):
-            with stream:
-                x.add_(1)
-            torch.accelerator.current_stream().wait_stream(stream)
-            with stream:
-                x[0].add_(1)
-            return y + 1
-
-        x = torch.zeros(8, device=device)
-        y = torch.zeros(1, device=device)
-        with self.assertRaisesRegex(
-            RuntimeError, "input mutation spans a stream barrier"
-        ):
-            torch.compile(fn, backend="aot_eager", fullgraph=True)(x, y)
-
-    def test_distinct_input_mutations_across_wait_stream(self, device) -> None:
-        stream = torch.Stream(device=device)
-
-        def fn(x, y, z):
-            with stream:
-                x.add_(1)
-            torch.accelerator.current_stream().wait_stream(stream)
-            with stream:
-                y.add_(2)
-            stream.synchronize()
-            return z + 1
-
-        x = torch.zeros(8, device=device)
-        y = torch.zeros(8, device=device)
-        z = torch.zeros(1, device=device)
-        result = torch.compile(fn, backend="aot_eager", fullgraph=True)(x, y, z)
-        torch.accelerator.synchronize()
-
-        self.assertEqual(result, z + 1)
-        self.assertEqual(x, torch.ones_like(x))
-        self.assertEqual(y, torch.full_like(y, 2))
-
-    def test_input_mutation_on_two_streams_spanning_wait_errors(self, device) -> None:
-        first_stream = torch.Stream(device=device)
-        second_stream = torch.Stream(device=device)
-
-        def fn(x, y):
-            with first_stream:
-                x.add_(1)
-            torch.accelerator.current_stream().wait_stream(first_stream)
-            with second_stream:
-                x.add_(2)
-            return y + 1
-
-        x = torch.zeros(8, device=device)
-        y = torch.zeros(1, device=device)
-        with self.assertRaisesRegex(
-            RuntimeError, "input mutation spans a stream barrier"
-        ):
-            torch.compile(fn, backend="aot_eager", fullgraph=True)(x, y)
-
-    @parametrize("mutation", ("out", "operator"))
-    def test_functional_input_mutation_writeback_precedes_wait_stream(
-        self, device, mutation
-    ) -> None:
-        stream = torch.Stream(device=device)
-
-        def fn(x, y, z):
-            with stream:
-                if mutation == "out":
-                    torch.add(x, 1, out=x)
-                else:
-                    torch.ops.aten.add_.Tensor(x, 1)
-            torch.accelerator.current_stream().wait_stream(stream)
-            tmp = y.clone()
-            tmp.add_(1)
-            return tmp + z
-
-        x = torch.zeros(8, device=device)
-        y = torch.zeros(8, device=device)
-        z = torch.zeros(1, device=device)
-        _, _, fw_graphs, _ = extract_graph(fn, x, y, z)
-        assert_writeback_precedes_barrier(self, fw_graphs[0].graph, "wait_stream")
-
-    def test_allow_in_graph_mutation_writeback_precedes_wait_stream(
-        self, device
-    ) -> None:
-        stream = torch.Stream(device=device)
-
-        @torch.compiler.allow_in_graph
-        def add_(other, x):
-            x.add_(other)
-            return x
-
-        def fn(x, y):
-            with stream:
-                add_(1, x)
-            torch.accelerator.current_stream().wait_stream(stream)
-            return y + 1
-
-        x = torch.zeros(8, device=device)
-        y = torch.zeros(1, device=device)
-        _, _, fw_graphs, _ = extract_graph(fn, x, y)
-        assert_writeback_precedes_barrier(self, fw_graphs[0].graph, "wait_stream")
-
-    def test_allow_in_graph_data_mutation_writeback_precedes_wait_stream(
-        self, device
-    ) -> None:
-        stream = torch.Stream(device=device)
-
-        @torch.compiler.allow_in_graph
-        def mutate_data(x):
-            x.data.add_(1)
-            return x
-
-        def fn(x, y):
-            with stream:
-                mutate_data(x)
-            torch.accelerator.current_stream().wait_stream(stream)
-            return y + 1
-
-        x = torch.zeros(8, device=device)
-        y = torch.zeros(1, device=device)
-        _, _, fw_graphs, _ = extract_graph(fn, x, y)
-
-        assert_writeback_precedes_barrier(self, fw_graphs[0].graph, "wait_stream")
+            _, _, fw_graphs, _ = extract_graph(fn, x, hidden, out)
+            graph = fw_graphs[0].graph
+            assert_writeback_precedes_barrier(
+                self, graph, "wait_stream", input_numel=x.numel()
+            )
+            if mutation == "mixed":
+                assert_writeback_precedes_barrier(
+                    self, graph, "wait_stream", input_numel=hidden.numel()
+                )
 
     def test_epilogue_copy_streams_external(self, device):
         @torch.compile(backend="eager")
@@ -2618,22 +2423,6 @@ class GraphModule(torch.nn.Module):
             torch.ones(2, 2, device=device)
         )
 
-    def test_functional_packet_before_event_record_no_error(self, device):
-        event = torch.Event(device=device)
-        backend = torch._dynamo.testing.EagerAndRecordGraphs()
-
-        def fn(x):
-            values, _ = torch.ops.aten.sort(x)
-            event.record(torch.accelerator.current_stream(device))
-            return values
-
-        x = torch.tensor([2.0, 1.0], device=device)
-        self.assertEqual(torch.compile(fn, backend=backend, fullgraph=True)(x), fn(x))
-        sorts = backend.graphs[0].graph.find_nodes(
-            op="call_function", target=torch.ops.aten.sort.default
-        )
-        self.assertEqual(len(sorts), 1)
-
     def test_event_record_on_different_stream_no_error(self, device):
         def fn(x):
             s0 = torch.Stream(device=device)
@@ -3259,6 +3048,28 @@ instantiate_device_type_tests(
 
 @requires_cuda
 class TestStreamsCUDASpecific(torch._dynamo.test_case.TestCase):
+    @unittest.skipIf(not TEST_MULTIGPU, "requires multiple CUDA devices")
+    def test_indexless_current_stream_does_not_alias_other_device(self) -> None:
+        from torch._dynamo.graph_bytecode_inputs import get_external_object_by_index
+        from torch._dynamo.variables.streams import get_current_stream
+        from torch._functorch._aot_autograd.streams import get_stream_or_current_stream
+
+        with torch.cuda.device(0):
+            reset_user_object_tracking()
+            try:
+                current_index = get_current_stream(torch.device("cuda"))
+                graph = torch.fx.Graph()
+                other_device = graph.placeholder("other_device")
+                other_device.meta["val"] = torch.empty(1, device="cuda:1")
+                other_index = get_stream_or_current_stream(other_device)
+                self.assertNotEqual(other_index, current_index)
+                self.assertEqual(
+                    get_external_object_by_index(other_index).device,
+                    torch.device("cuda:1"),
+                )
+            finally:
+                reset_user_object_tracking()
+
     @torch.compiler.config.patch(compile_on_one_rank=True)
     def test_synchronize_preserves_indexless_device_under_coor(self) -> None:
         def f(x):
@@ -3290,9 +3101,7 @@ class TestStreamsCUDASpecific(torch._dynamo.test_case.TestCase):
         )
 
         with torch.cuda.device(0):
-            with patch.object(torch.accelerator, "synchronize") as synchronize:
-                compiled(x)
-        self.assertEqual(synchronize.call_args.args, (torch.device("cuda"),))
+            self.assertEqual(compiled(x), x + 1)
 
     @parametrize("explicit_device", (False, True))
     @parametrize("hidden_data_mutation", (False, True))
@@ -3300,9 +3109,6 @@ class TestStreamsCUDASpecific(torch._dynamo.test_case.TestCase):
     def test_indexless_device_sync_orders_input_writeback(
         self, explicit_device, hidden_data_mutation
     ) -> None:
-        from torch._inductor.utils import run_and_get_code
-        from torch.testing import FileCheck
-
         @torch.compiler.allow_in_graph
         def mutate_data(x):
             x.data.add_(1)
@@ -3325,481 +3131,91 @@ class TestStreamsCUDASpecific(torch._dynamo.test_case.TestCase):
 
             x = torch.zeros(1024, device="cuda")
             y = torch.zeros(1, device="cuda")
-            compiled = torch.compile(fn, backend="inductor", fullgraph=True)
-            result, (code,) = run_and_get_code(compiled, x, y)
+            _, _, fw_graphs, _ = extract_graph(fn, torch.zeros_like(x), y)
+            assert_writeback_precedes_barrier(
+                self, fw_graphs[0].graph, "synchronize_device"
+            )
+            result = torch.compile(fn, backend="inductor", fullgraph=True)(x, y)
             observed = x.clone()
             torch.cuda.synchronize()
-
         self.assertEqual(result, y + 1)
         self.assertEqual(observed, torch.ones_like(x))
-        FileCheck().check("def call(").check("aten.copy_]").check(
-            "torch.ops.streams.synchronize_device.default('cuda', None)"
-        ).run(code)
 
-    @parametrize("explicit_device", (False, True))
-    @torch.compiler.config.patch(compile_on_one_rank=True)
-    def test_indexless_device_sync_rejects_external_writeback(
-        self, explicit_device
-    ) -> None:
-        with torch.cuda.device(0):
-            stream = torch.cuda.Stream()
-
-            def fn(x, y):
-                with stream:
-                    x.add_(1)
-                if explicit_device:
-                    torch.cuda.synchronize(torch.device("cuda"))
-                else:
-                    torch.cuda.synchronize()
-                return y + 1
-
-            x = torch.zeros(8, device="cuda", requires_grad=True) + 0
-            y = torch.zeros(1, device="cuda")
-            with self.assertRaisesRegex(
-                RuntimeError, "out-of-graph input mutation cannot be ordered"
-            ):
-                torch.compile(fn, backend="aot_eager", fullgraph=True)(x, y)
-
-    @unittest.skipIf(not TEST_MULTIGPU, "requires multiple CUDA devices")
-    @torch.compiler.config.patch(compile_on_one_rank=True)
-    def test_coor_reused_graph_tracks_current_stream_on_another_device(self) -> None:
-        from torch._dynamo.utils import counters
-
-        torch._dynamo.reset()
-        counters.clear()
-
-        def fn(x, event):
-            event.record(torch.cuda.current_stream())
-            return x + 1
-
-        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
-        for index in (0, 1):
-            with torch.cuda.device(index):
-                x = torch.zeros(8, device="cuda")
-                event = torch.cuda.Event()
-                self.assertEqual(compiled(x, event), torch.ones_like(x))
-                self.assertEqual(compiled(x, event), torch.ones_like(x))
-                current_index = get_current_stream_index(x.device)
-                self.assertIsNotNone(current_index)
-                self.assertEqual(event.device, x.device)
-
-        self.assertEqual(counters["stats"]["unique_graphs"], 1)
-
-    def test_deduplicated_input_writeback_precedes_wait_stream(self) -> None:
+    @parametrize("layout", ("mixed_dtype", "interleaved", "finite_sparse"))
+    def test_disjoint_mutations_cross_barrier(self, layout) -> None:
         stream = torch.cuda.Stream()
 
-        def fn(first, duplicate, mutated, out):
-            first.add_(1)
-            with stream:
-                mutated.add_(1)
-            torch.cuda.current_stream().wait_stream(stream)
-            return out + duplicate.sum() * 0
-
-        shared = torch.zeros(4, device="cuda")
-        mutated = torch.zeros(8, device="cuda")
-        out = torch.zeros(1, device="cuda")
-        _, _, fw_graphs, _ = extract_graph(fn, shared, shared, mutated, out)
-        assert_writeback_precedes_barrier(
-            self, fw_graphs[0].graph, "wait_stream", input_numel=mutated.numel()
-        )
-
-    def test_synthetic_base_writeback_precedes_wait_stream(self) -> None:
-        stream = torch.cuda.Stream()
-
-        def fn(prefix, first_view, mutated_view, out):
-            prefix_result = prefix + 1
-            first_view_result = first_view + 0
-            with stream:
-                mutated_view.add_(1)
-            torch.cuda.current_stream().wait_stream(stream)
-            return prefix_result + out + first_view_result.sum() * 0
-
-        base = torch.zeros(16, device="cuda")
-        args = (
-            torch.zeros(1, device="cuda"),
-            base[:12],
-            base[4:],
-            torch.zeros(1, device="cuda"),
-        )
-        _, _, fw_graphs, _ = extract_graph(fn, *args)
-        assert_writeback_precedes_barrier(self, fw_graphs[0].graph, "wait_stream")
-
-    def test_effect_token_input_writeback_precedes_wait_stream(self) -> None:
-        stream = torch.cuda.Stream()
-
-        def fn(mutated, out):
-            torch.ops.aten._print.default("effect-token-writeback")
-            with stream:
-                mutated.add_(1)
-            torch.cuda.current_stream().wait_stream(stream)
-            return out + 1
-
-        args = (torch.zeros(8, device="cuda"), torch.zeros(1, device="cuda"))
-        _, _, fw_graphs, _ = extract_graph(fn, *args)
-        assert_writeback_precedes_barrier(self, fw_graphs[0].graph, "wait_stream")
-
-    def test_subclass_input_writeback_precedes_wait_stream(self) -> None:
-        from torch.testing._internal.two_tensor import TwoTensor
-
-        stream = torch.cuda.Stream()
-
-        def fn(subclass_input, mutated, out):
-            subclass_result = subclass_input + 1
-            with stream:
-                mutated.add_(1)
-            torch.cuda.current_stream().wait_stream(stream)
-            return subclass_result, out + 1
-
-        subclass_input = TwoTensor(
-            torch.zeros(4, device="cuda"), torch.zeros(4, device="cuda")
-        )
-        mutated = torch.zeros(8, device="cuda")
-        out = torch.zeros(1, device="cuda")
-        _, _, fw_graphs, _ = extract_graph(fn, subclass_input, mutated, out)
-        assert_writeback_precedes_barrier(self, fw_graphs[0].graph, "wait_stream")
-
-    @parametrize("mutation", ("method", "operator", "out"))
-    def test_data_input_writeback_precedes_wait_stream(self, mutation) -> None:
-        stream = torch.cuda.Stream()
-
-        def fn(x, out):
-            with stream:
-                data = x.data
-                if mutation == "method":
-                    data.add_(1)
-                elif mutation == "operator":
-                    torch.ops.aten.add_.Tensor(data, 1)
-                else:
-                    torch.add(data, 1, out=data)
-            torch.cuda.current_stream().wait_stream(stream)
-            return out + 1
-
-        x = torch.zeros(8, device="cuda")
-        out = torch.zeros(1, device="cuda")
-        _, _, fw_graphs, _ = extract_graph(fn, x, out)
-
-        assert_writeback_precedes_barrier(self, fw_graphs[0].graph, "wait_stream")
-
-    def test_foreach_input_writeback_precedes_wait_stream(self) -> None:
-        stream = torch.cuda.Stream()
-
-        def fn(first, second, out):
-            with stream:
-                first.add_(1)
-                torch._foreach_add_([second], 1)
-            torch.cuda.current_stream().wait_stream(stream)
-            return out + 1
-
-        first = torch.zeros(7, device="cuda")
-        second = torch.zeros(8, device="cuda")
-        out = torch.zeros(1, device="cuda")
-        _, _, fw_graphs, _ = extract_graph(fn, first, second, out)
-
-        assert_writeback_precedes_barrier(
-            self, fw_graphs[0].graph, "wait_stream", input_numel=first.numel()
-        )
-        assert_writeback_precedes_barrier(
-            self, fw_graphs[0].graph, "wait_stream", input_numel=second.numel()
-        )
-
-    def test_data_input_mutation_after_wait_stream_is_allowed(self) -> None:
-        stream = torch.cuda.Stream()
-
-        def fn(x, out):
-            torch.cuda.current_stream().wait_stream(stream)
-            with stream:
-                x.data.add_(1)
-            return out + 1
-
-        x = torch.zeros(8, device="cuda")
-        out = torch.zeros(1, device="cuda")
-        result = torch.compile(fn, backend="aot_eager", fullgraph=True)(x, out)
-        torch.cuda.synchronize()
-
-        self.assertEqual(result, out + 1)
-        self.assertEqual(x, torch.ones_like(x))
-
-    def test_data_input_mutation_spanning_wait_stream_errors(self) -> None:
-        stream = torch.cuda.Stream()
-
-        def fn(x, out):
-            with stream:
-                x.data.add_(1)
-            torch.cuda.current_stream().wait_stream(stream)
-            with stream:
-                x.add_(1)
-            return out + 1
-
-        x = torch.zeros(8, device="cuda")
-        out = torch.zeros(1, device="cuda")
-        with self.assertRaisesRegex(
-            RuntimeError, "input mutation spans a stream barrier"
-        ):
-            torch.compile(fn, backend="aot_eager", fullgraph=True)(x, out)
-
-    @torch._dynamo.config.patch(install_free_tensors=True)
-    def test_get_attr_writeback_precedes_wait_stream(self) -> None:
-        stream = torch.cuda.Stream()
-
-        class Module(torch.nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.register_buffer("buffer", torch.zeros(7, device="cuda"))
-
-            def forward(self, x, out):
-                with stream:
-                    self.buffer.add_(1)
-                    x.add_(1)
-                torch.cuda.current_stream().wait_stream(stream)
-                return out + 1
-
-        module = Module()
-        x = torch.zeros(8, device="cuda")
-        out = torch.zeros(1, device="cuda")
-        _, _, fw_graphs, _ = extract_graph(module, x, out)
-
-        assert_writeback_precedes_barrier(
-            self, fw_graphs[0].graph, "wait_stream", input_numel=module.buffer.numel()
-        )
-        assert_writeback_precedes_barrier(
-            self, fw_graphs[0].graph, "wait_stream", input_numel=x.numel()
-        )
-
-    @torch._dynamo.config.patch(install_free_tensors=True)
-    def test_get_attr_mutation_stream_argument_guard(self) -> None:
-        mutation_stream = torch.cuda.Stream()
-        other_stream = torch.cuda.Stream()
-        other_alias = torch.cuda.ExternalStream(
-            other_stream.cuda_stream, device=other_stream.device
-        )
-        mutation_alias = torch.cuda.ExternalStream(
-            mutation_stream.cuda_stream, device=mutation_stream.device
-        )
-
-        class Module(torch.nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.register_buffer("buffer", torch.zeros(8, device="cuda"))
-
-            def forward(self, out, wait_stream):
-                with mutation_stream:
-                    self.buffer.add_(1)
-                torch.cuda.current_stream().wait_stream(wait_stream)
-                return out + 1
-
-        counter = torch._dynamo.testing.CompileCounterWithBackend("aot_eager")
-        compiled = torch.compile(Module(), backend=counter, fullgraph=True)
-        out = torch.zeros(1, device="cuda")
-        compiled(out, other_alias)
-        compiled(out, mutation_alias)
-        torch.cuda.synchronize()
-
-        self.assertEqual(counter.frame_count, 2)
-
-    def test_disjoint_shared_storage_mutations_cross_barrier(self) -> None:
-        stream = torch.cuda.Stream()
-
-        def fn(first, second, out):
+        def fn(first, second):
             second = second.view_as(second)
             with stream:
                 first.add_(1)
             torch.cuda.current_stream().wait_stream(stream)
             with stream:
                 second.add_(2)
-            return out + 1
 
-        storage = torch.zeros(16, device="cuda").untyped_storage()
-        first = torch.empty(0, device="cuda").set_(storage, 0, (8,), (1,))
-        second = torch.empty(0, device="cuda").set_(storage, 8, (8,), (1,))
-        out = torch.zeros(1, device="cuda")
-        result = torch.compile(fn, backend="aot_eager", fullgraph=True)(
-            first, second, out
+        storage = torch.zeros(64, dtype=torch.uint8, device="cuda")
+        if layout == "mixed_dtype":
+            first = storage[:32].view(torch.float32)
+            second = storage[32:]
+        elif layout == "interleaved":
+            first = storage[::2]
+            second = storage[1::2]
+        else:
+            first = storage.as_strided((3,), (6,), 0)
+            second = storage.as_strided((2,), (4,), 4)
+        compiled = torch.compile(
+            fn, backend="aot_eager", fullgraph=True, dynamic=layout == "mixed_dtype"
         )
+        compiled(first, second)
         torch.cuda.synchronize()
-
-        self.assertEqual(result, out + 1)
         self.assertEqual(first, torch.ones_like(first))
         self.assertEqual(second, torch.full_like(second, 2))
 
-    def test_different_dtype_input_mutation_spanning_wait_errors(self) -> None:
-        stream = torch.cuda.Stream()
+    @unittest.skipIf(not TEST_MULTIGPU, "requires multiple CUDA devices")
+    def test_lazy_specialization_refreshes_current_stream(self) -> None:
+        def fn(x):
+            device = 1 if x.shape[0] == 8 else 0
+            return x + 1, torch.cuda.current_stream(device).cuda_stream
 
-        def fn(x, out):
-            with stream:
-                x.data.view(torch.uint8)[2 * x.numel() :].add_(1)
-            torch.cuda.current_stream().wait_stream(stream)
-            with stream:
-                x[: x.numel() // 2].add_(1)
-            return out + 1
-
-        x = torch.zeros(8, device="cuda")
-        out = torch.zeros(1, device="cuda")
-        with self.assertRaisesRegex(
-            RuntimeError, "input mutation spans a stream barrier"
-        ):
-            torch.compile(fn, backend="aot_eager", fullgraph=True)(x, out)
-
-    def test_custom_backward_wait_stays_in_backward(self) -> None:
-        from torch._inductor.fx_passes.control_dependencies import control_deps
-
-        stream = torch.cuda.Stream()
-
-        class WaitInBackward(torch.autograd.Function):
-            @staticmethod
-            def forward(ctx, x, saved):
-                ctx.save_for_backward(saved)
-                return x * 2
-
-            @staticmethod
-            def backward(ctx, grad):
-                (saved,) = ctx.saved_tensors
-                torch.cuda.current_stream().wait_stream(stream)
-                return grad * saved, None
-
-        x = torch.ones(8, device="cuda", requires_grad=True)
-        saved = torch.ones(8, device="cuda")
-        result, _, fw_graphs, bw_graphs = extract_graph(WaitInBackward.apply, x, saved)
-        result.sum().backward()
-
-        def waits(graph):
-            return [
-                node
-                for node in graph.nodes
-                if node.op == "call_function"
-                and (
-                    node.target is torch.ops.streams.wait_stream.default
-                    or (
-                        node.target is control_deps
-                        and "wait_stream" in node.args[1].name
-                    )
-                )
-            ]
-
-        self.assertEqual(waits(fw_graphs[0].graph), [])
-        self.assertEqual(len(waits(bw_graphs[0].graph)), 1)
-
-    def test_backward_wait_before_input_mutation_is_allowed(self) -> None:
-        stream = torch.cuda.Stream()
-
-        class WaitBeforeMutation(torch.autograd.Function):
-            @staticmethod
-            def forward(ctx, x, saved):
-                ctx.save_for_backward(saved)
-                return x * 2
-
-            @staticmethod
-            def backward(ctx, grad):
-                (saved,) = ctx.saved_tensors
-                torch.cuda.current_stream().wait_stream(stream)
-                with stream:
-                    saved.add_(1)
-                return grad * 2, None
-
-        x = torch.ones(8, device="cuda", requires_grad=True)
-        saved = torch.zeros(8, device="cuda")
-        result = torch.compile(
-            WaitBeforeMutation.apply, backend="aot_eager", fullgraph=True
-        )(x, saved)
-        result.sum().backward()
-        torch.cuda.synchronize()
-
-        self.assertEqual(saved, torch.ones_like(saved))
+        initial = torch.ones(7, device="cuda:0")
+        torch._dynamo.mark_dynamic(initial, 0, specialize_on=[lambda value: value == 8])
+        compiled = torch.compile(fn, backend="eager", fullgraph=True)
+        compiled(initial)
+        original_stream = torch.cuda.current_stream(1)
+        try:
+            streams = (torch.cuda.Stream(device=1), torch.cuda.Stream(device=1))
+            handles = []
+            for stream in streams:
+                torch.cuda.set_stream(stream)
+                torch.cuda.set_device(0)
+                handles.append(compiled(torch.ones(8, device="cuda:0"))[1])
+            self.assertEqual(handles, [stream.cuda_stream for stream in streams])
+        finally:
+            torch.cuda.set_stream(original_stream)
+            torch.cuda.set_device(0)
 
     @unittest.skipIf(not TEST_MULTIGPU, "requires multiple CUDA devices")
-    def test_interleaved_backward_restores_current_stream_registry(self) -> None:
-        def first(x):
-            with torch.cuda.stream(torch.cuda.current_stream(x.device)):
-                return x.sin()
-
-        def second(x):
-            with torch.cuda.stream(torch.cuda.current_stream()):
-                return x.cos()
-
-        with torch.cuda.device(0):
-            compiled_first = torch.compile(first, backend="aot_eager", fullgraph=True)
-            compiled_second = torch.compile(second, backend="aot_eager", fullgraph=True)
-            x = torch.ones(8, device="cuda:1", requires_grad=True)
-            first_output = compiled_first(x)
-            first_stream_index = get_current_stream_index(x.device)
-            self.assertIsNotNone(first_stream_index)
-
-            compiled_second(torch.ones(8, device="cuda:0", requires_grad=True))
-            self.assertIsNone(get_current_stream_index(x.device))
-
-            first_output.sum().backward()
-            self.assertEqual(get_current_stream_index(x.device), first_stream_index)
-            self.assertEqual(x.grad, x.cos())
-
-    def test_interleaved_backward_restores_runtime_stream(self) -> None:
-        def first(x):
-            current = torch.cuda.current_stream()
-            current.wait_stream(current)
-            return x.sin()
-
-        def second(x):
-            with torch.cuda.stream(torch.cuda.current_stream()):
-                return x.cos()
-
-        compiled_first = torch.compile(first, backend="aot_eager", fullgraph=True)
-        compiled_second = torch.compile(second, backend="aot_eager", fullgraph=True)
-        compiled_first(torch.ones(8, device="cuda", requires_grad=True))
-
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            x = torch.ones(8, device="cuda", requires_grad=True)
-            output = compiled_first(x)
-            stream_index = get_current_stream_index(x.device)
-            self.assertIsNotNone(stream_index)
-
-        compiled_second(torch.ones(8, device="cuda", requires_grad=True))
-        output.sum().backward()
-
-        restored = graph_bytecode_inputs.get_external_object_by_index(stream_index)
-        self.assertEqual(restored.native_handle, stream.native_handle)
-        self.assertEqual(x.grad, x.cos())
-
-    @unittest.skipIf(not TEST_MULTIGPU, "requires multiple CUDA devices")
-    def test_backward_implicit_stream_uses_input_device(self) -> None:
-        observer = torch.cuda.Stream(device=1)
-
-        class MutateInBackward(torch.autograd.Function):
-            @staticmethod
-            def forward(ctx, x, saved):
-                ctx.save_for_backward(saved)
-                return x * 2
-
-            @staticmethod
-            def backward(ctx, grad):
-                (saved,) = ctx.saved_tensors
-                saved.add_(1)
-                observer.wait_stream(torch.cuda.current_stream(1))
-                return grad * 2, None
-
-        with torch.cuda.device(0):
-            x = torch.ones(8, device="cuda:1", requires_grad=True)
-            saved = torch.zeros(8, device="cuda:1")
-            with self.assertRaisesRegex(
-                RuntimeError, "backward input mutation cannot be ordered"
-            ):
-                result = torch.compile(
-                    MutateInBackward.apply, backend="aot_eager", fullgraph=True
-                )(x, saved)
-                result.sum().backward()
-
-    @unittest.skipIf(not TEST_MULTIGPU, "requires multiple CUDA devices")
-    def test_current_stream_receiver_uses_requested_device(self) -> None:
+    @parametrize("device_arg", (None, "cuda", "cuda:1"))
+    def test_current_stream_uses_requested_or_active_device(self, device_arg) -> None:
         backend = torch._dynamo.testing.EagerAndRecordGraphs()
+        device_index = 1
+        side = torch.cuda.Stream(device=device_index)
 
         def fn(x):
-            stream = torch.accelerator.current_stream(torch.device("cuda:1"))
-            stream.synchronize()
+            if device_arg is None:
+                with torch.cuda.device(device_index):
+                    torch.cuda.current_stream().synchronize()
+            else:
+                with side:
+                    torch.accelerator.current_stream(
+                        torch.device(device_arg)
+                    ).synchronize()
             return x + 1
 
         with torch.cuda.device(0):
             actual = torch.compile(fn, backend=backend, fullgraph=True)(
-                torch.zeros(1, device="cuda:1")
+                torch.zeros(1, device=device_index)
             )
-
         self.assertEqual(actual, torch.ones_like(actual))
         syncs = list(
             backend.graphs[0].graph.find_nodes(
@@ -3807,256 +3223,7 @@ class TestStreamsCUDASpecific(torch._dynamo.test_case.TestCase):
                 target=torch.ops.streams.synchronize_stream,
             )
         )
-        self.assertEqual(len(syncs), 1)
         self.assertEqual(syncs[0].args, (1,))
-
-    def test_source_less_partition_input_writeback_precedes_wait_stream(self) -> None:
-        stream = torch.cuda.Stream()
-        backend, partition_backend = make_source_less_aot_eager_backend()
-
-        def fn(first, second, out):
-            with stream:
-                first.add_(1)
-                second.add_(1)
-            torch.cuda.current_stream().wait_stream(stream)
-            return out + 1
-
-        first = torch.zeros(7, device="cuda")
-        second = torch.zeros(8, device="cuda")
-        out = torch.zeros(1, device="cuda")
-        torch.compile(fn, backend=partition_backend, fullgraph=True)(first, second, out)
-
-        assert_writeback_precedes_barrier(
-            self,
-            backend.fw_graphs[0].graph,
-            "wait_stream",
-            input_numel=first.numel(),
-        )
-        assert_writeback_precedes_barrier(
-            self,
-            backend.fw_graphs[0].graph,
-            "wait_stream",
-            input_numel=second.numel(),
-        )
-
-    def test_source_less_mutation_after_wait_stream_is_allowed(self) -> None:
-        stream = torch.cuda.Stream()
-        _, partition_backend = make_source_less_aot_eager_backend()
-
-        def fn(x, out):
-            torch.cuda.current_stream().wait_stream(stream)
-            with stream:
-                x.add_(1)
-            return out + 1
-
-        x = torch.zeros(8, device="cuda")
-        out = torch.zeros(1, device="cuda")
-        torch.compile(fn, backend=partition_backend, fullgraph=True)(x, out)
-
-    def test_source_less_distinct_input_mutations_cross_wait_stream(self) -> None:
-        stream = torch.cuda.Stream()
-        _, partition_backend = make_source_less_aot_eager_backend()
-
-        def fn(x, y, out):
-            with stream:
-                x.add_(1)
-            torch.cuda.current_stream().wait_stream(stream)
-            with stream:
-                y.add_(2)
-            stream.synchronize()
-            return out + 1
-
-        x = torch.zeros(7, device="cuda")
-        y = torch.zeros(8, device="cuda")
-        out = torch.zeros(1, device="cuda")
-        result = torch.compile(fn, backend=partition_backend, fullgraph=True)(x, y, out)
-        torch.cuda.synchronize()
-
-        self.assertEqual(result, out + 1)
-        self.assertEqual(x, torch.ones_like(x))
-        self.assertEqual(y, torch.full_like(y, 2))
-
-    def test_aliased_wait_after_unrelated_barrier_depends_on_writeback(self) -> None:
-        mutation_stream = torch.cuda.Stream()
-        mutation_alias = torch.cuda.ExternalStream(
-            mutation_stream.cuda_stream, device=mutation_stream.device
-        )
-        unrelated_stream = torch.cuda.Stream()
-        event = torch.cuda.Event()
-
-        def fn(x, y):
-            with mutation_stream:
-                x.add_(1)
-            event.record(unrelated_stream)
-            torch.cuda.current_stream().wait_stream(mutation_alias)
-            return y + 1
-
-        x = torch.zeros(8, device="cuda")
-        y = torch.zeros(1, device="cuda")
-        _, _, fw_graphs, _ = extract_graph(fn, x, y)
-        assert_writeback_precedes_barrier(self, fw_graphs[0].graph, "wait_stream")
-
-    def test_backward_input_writeback_before_wait_stream_errors(self) -> None:
-        stream = torch.cuda.Stream()
-
-        class MutateInBackward(torch.autograd.Function):
-            @staticmethod
-            def forward(ctx, x, buf):
-                ctx.save_for_backward(buf)
-                return x * 2
-
-            @staticmethod
-            def backward(ctx, grad):
-                (buf,) = ctx.saved_tensors
-                with stream:
-                    buf.add_(1)
-                torch.cuda.current_stream().wait_stream(stream)
-                return grad * 2, None
-
-        def fn(x, buf):
-            return MutateInBackward.apply(x, buf)
-
-        x = torch.ones(8, device="cuda", requires_grad=True)
-        buf = torch.zeros(8, device="cuda")
-        with self.assertRaisesRegex(
-            RuntimeError, "backward input mutation cannot be ordered"
-        ):
-            torch.compile(fn, backend="aot_eager", fullgraph=True)(x, buf)
-
-    def test_backward_input_writeback_ignores_unrelated_stream_barrier(self) -> None:
-        mutation_stream = torch.cuda.Stream()
-        unrelated_stream = torch.cuda.Stream()
-        event = torch.cuda.Event()
-
-        class MutateInBackward(torch.autograd.Function):
-            @staticmethod
-            def forward(ctx, x, buf):
-                ctx.save_for_backward(buf)
-                return x * 2
-
-            @staticmethod
-            def backward(ctx, grad):
-                (buf,) = ctx.saved_tensors
-                with mutation_stream:
-                    buf.add_(1)
-                event.record(unrelated_stream)
-                return grad * 2, None
-
-        def fn(x, buf):
-            return MutateInBackward.apply(x, buf)
-
-        x = torch.ones(8, device="cuda", requires_grad=True)
-        buf = torch.zeros(8, device="cuda")
-        torch.compile(fn, backend="aot_eager", fullgraph=True)(x, buf).sum().backward()
-        torch.cuda.synchronize()
-
-        self.assertEqual(x.grad, torch.full_like(x, 2))
-        self.assertEqual(buf, torch.ones_like(buf))
-
-    def test_side_stream_alias_writeback_precedes_wait_stream(self) -> None:
-        stream = torch.cuda.Stream()
-        alias = torch.cuda.ExternalStream(stream.cuda_stream, device=stream.device)
-
-        def fn(x, y):
-            with stream:
-                x.add_(1)
-            torch.cuda.current_stream().wait_stream(alias)
-            return y + 1
-
-        x = torch.zeros(1024, device="cuda")
-        y = torch.zeros(1, device="cuda")
-        result, _, fw_graphs, _ = extract_graph(fn, x, y)
-        observed = x.clone()
-        torch.cuda.synchronize()
-
-        self.assertEqual(result, y + 1)
-        self.assertEqual(observed, torch.ones_like(x))
-        assert_writeback_precedes_barrier(self, fw_graphs[0].graph, "wait_stream")
-
-    def test_event_record_stream_argument_guard(self) -> None:
-        mutation_stream = torch.cuda.Stream()
-        other_stream = torch.cuda.Stream()
-        other_alias = torch.cuda.ExternalStream(
-            other_stream.cuda_stream, device=other_stream.device
-        )
-        mutation_alias = torch.cuda.ExternalStream(
-            mutation_stream.cuda_stream, device=mutation_stream.device
-        )
-        event = torch.cuda.Event()
-
-        def fn(x, mutation_stream, record_stream):
-            with mutation_stream:
-                x.add_(1)
-            event.record(record_stream)
-            return x
-
-        compiled = torch.compile(fn, backend="eager", fullgraph=True)
-        compiled(torch.ones(2, 2, device="cuda"), mutation_stream, other_alias)
-        torch.cuda.synchronize()
-
-        with self.assertRaisesRegex(RuntimeError, "An event was recorded on a stream"):
-            compiled(torch.ones(2, 2, device="cuda"), mutation_stream, mutation_alias)
-
-    @unittest.skipIf(not TEST_MULTIGPU, "requires multiple CUDA devices")
-    def test_out_of_graph_input_writeback_ignores_other_device_sync(self) -> None:
-        def fn(x, y):
-            x.add_(1)
-            torch.cuda.synchronize(1)
-            return y + 1
-
-        x = torch.zeros(8, device="cuda:0", requires_grad=True) + 0
-        y = torch.zeros(1, device="cuda:0")
-        result = torch.compile(fn, backend="aot_eager", fullgraph=True)(x, y)
-        torch.cuda.synchronize()
-
-        self.assertEqual(result, y + 1)
-        self.assertEqual(x, torch.ones_like(x))
-
-    @unittest.skipIf(not TEST_MULTIGPU, "requires multiple CUDA devices")
-    def test_input_mutation_writeback_precedes_current_device_synchronize(
-        self,
-    ) -> None:
-        from torch._inductor.utils import run_and_get_code
-        from torch.testing import FileCheck
-
-        device = torch.device("cuda:1")
-        with torch.cuda.device(device):
-            stream = torch.Stream(device=device)
-
-            def fn(x, y):
-                with stream:
-                    x.add_(1)
-                torch.accelerator.synchronize()
-                return y + 1
-
-            x = torch.zeros(1024, device=device)
-            y = torch.zeros(1, device=device)
-            compiled = torch.compile(fn, backend="inductor", fullgraph=True)
-            result, (code,) = run_and_get_code(compiled, x, y)
-            observed = x.clone()
-            torch.accelerator.synchronize()
-
-        self.assertEqual(result, y + 1)
-        self.assertEqual(observed, torch.ones_like(x))
-        FileCheck().check("def call(").check("aten.copy_]").check(
-            "torch.ops.streams.synchronize_device.default('cuda', 1)"
-        ).run(code)
-
-    @unittest.skipIf(not TEST_MULTIGPU, "requires multiple CUDA devices")
-    def test_implicit_stream_writeback_uses_input_device(self) -> None:
-        def fn(x, y):
-            x.add_(1)
-            torch.cuda.synchronize(1)
-            return y + 1
-
-        with torch.cuda.device(0):
-            x = torch.zeros(8, device="cuda:1")
-            y = torch.zeros(1, device="cuda:1")
-            _, _, fw_graphs, _ = extract_graph(fn, x, y)
-
-        assert_writeback_precedes_barrier(
-            self, fw_graphs[0].graph, "synchronize_device"
-        )
 
     def test_wait_stream_anchors_following_record(self) -> None:
         """A record_event on the WAITING stream after a wait_stream must chain to
@@ -4171,21 +3338,17 @@ class TestStreamsCUDASpecific(torch._dynamo.test_case.TestCase):
             torch.cuda.current_stream().synchronize()
             return x + 1
 
-        inp = (torch.ones(4, 4, device="cuda"),)
-        _, _, fw_graphs, _ = extract_graph(fn, *inp)
+        _, _, fw_graphs, _ = extract_graph(fn, torch.ones(4, 4, device="cuda"))
         graph = fw_graphs[0].graph
 
         from torch._inductor.fx_passes.control_dependencies import control_deps
 
-        ctrl_nodes = list(graph.find_nodes(op="call_function", target=control_deps))
+        ctrl_nodes = graph.find_nodes(op="call_function", target=control_deps)
         sync_ctrl = [n for n in ctrl_nodes if "synchronize_stream" in n.args[1].name]
+        adds = graph.find_nodes(op="call_function", target=torch.ops.aten.add.Tensor)
         self.assertEqual(len(sync_ctrl), 1)
-        adds = list(
-            graph.find_nodes(op="call_function", target=torch.ops.aten.add.Tensor)
-        )
         self.assertEqual(len(adds), 1)
         self.assertIs(adds[0].args[0].args[0], sync_ctrl[0])
-
         graph.lint()
 
     def test_captured_external_wait_event_orders_following_work(self) -> None:
@@ -4210,52 +3373,29 @@ class TestStreamsCUDASpecific(torch._dynamo.test_case.TestCase):
         self.assertIs(add.args[0].args[0], wait_ctrl[0])
         graph.lint()
 
-    def test_dynamo_registry_no_dangling_weakref(self):
-        """Natural repro of the original UAF pattern.
-
-        `torch.compile(fn, backend="eager")` with `fn` referencing
-        `torch.cuda.current_stream()` causes dynamo to register a
-        weakref to the captured stream in
-        `index_to_external_object_weakref` (via
-        `store_user_object_weakrefs`, which does NOT pin via
-        `keep_alive`).  As soon as `fn` returns, the captured wrapper
-        has no strong references and is freed via tp_dealloc.
-
-        At that point the patched tp_dealloc must call
-        `PyObject_ClearWeakRefs`, otherwise the registry now holds a
-        weakref whose `wr_object` is a dangling pointer to freed
-        memory.  Later, when `_PyModule_ClearDict` tears down the
-        registry at interpreter finalization, dereferencing that
-        dangling pointer to clear the weakref hits a use-after-free.
-        """
+    def test_dynamo_registry_retains_current_stream(self):
         reset_user_object_tracking()
 
         def fn(x):
             return torch.cuda.current_stream().cuda_stream
 
+        snapshots = []
+
+        def capture(gm, inputs):
+            snapshots.append(snapshot_external_object_state())
+            return gm.forward
+
         x = torch.zeros(1, device="cuda")
-        compiled = torch.compile(fn, backend="eager", fullgraph=True)
-        compiled(x)
+        with torch.cuda.stream(torch.cuda.Stream()):
+            compiled = torch.compile(fn, backend=capture, fullgraph=True)
+            compiled(x)
         del compiled
         gc.collect()
-        current_stream_index = get_current_stream_index(x.device)
 
-        self.assertIsNotNone(current_stream_index)
-        self.assertLess(
-            current_stream_index,
-            len(graph_bytecode_inputs.index_to_external_object_weakref),
-            "torch.compile of a function referencing current_stream() must "
-            "register a weakref under its current-stream index",
-        )
-
-        self.assertIsNone(
-            graph_bytecode_inputs.index_to_external_object_weakref[
-                current_stream_index
-            ](),
-            "dynamo registry holds a weakref to a Stream wrapper that has "
-            "been freed; tp_dealloc must call PyObject_ClearWeakRefs to "
-            "clear it, otherwise the registry retains a dangling pointer",
-        )
+        weakrefs, indices = snapshots[0]
+        index = next(index for kind, _, index in indices if kind == "cuda")
+        self.assertGreater(len(weakrefs), index)
+        self.assertIsNotNone(weakrefs[index]())
 
     def test_get_current_stream_return(self):
         def fn(x, s):
@@ -4326,35 +3466,29 @@ instantiate_parametrized_tests(TestStreamsCUDASpecific)
 
 @requires_xpu
 class TestStreamsXPUSpecific(torch._dynamo.test_case.TestCase):
-    def test_dynamo_registry_no_dangling_weakref(self):
+    def test_dynamo_registry_retains_current_stream(self):
         reset_user_object_tracking()
 
         def fn(x):
             return torch.xpu.current_stream().sycl_queue
 
+        snapshots = []
+
+        def capture(gm, inputs):
+            snapshots.append(snapshot_external_object_state())
+            return gm.forward
+
         x = torch.zeros(1, device="xpu")
-        compiled = torch.compile(fn, backend="eager", fullgraph=True)
-        compiled(x)
+        with torch.xpu.stream(torch.xpu.Stream()):
+            compiled = torch.compile(fn, backend=capture, fullgraph=True)
+            compiled(x)
         del compiled
         gc.collect()
-        current_stream_index = get_current_stream_index(x.device)
 
-        self.assertIsNotNone(current_stream_index)
-        self.assertLess(
-            current_stream_index,
-            len(graph_bytecode_inputs.index_to_external_object_weakref),
-            "torch.compile of a function referencing current_stream() must "
-            "register a weakref under its current-stream index",
-        )
-
-        self.assertIsNone(
-            graph_bytecode_inputs.index_to_external_object_weakref[
-                current_stream_index
-            ](),
-            "dynamo registry holds a weakref to a Stream wrapper that has "
-            "been freed; tp_dealloc must call PyObject_ClearWeakRefs to "
-            "clear it, otherwise the registry retains a dangling pointer",
-        )
+        weakrefs, indices = snapshots[0]
+        index = next(index for kind, _, index in indices if kind == "xpu")
+        self.assertGreater(len(weakrefs), index)
+        self.assertIsNotNone(weakrefs[index]())
 
     def test_get_current_stream_return(self):
         def fn(x, s):

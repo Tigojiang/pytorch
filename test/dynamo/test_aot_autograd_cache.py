@@ -25,6 +25,12 @@ import torch._functorch._aot_autograd.autograd_cache as autograd_cache
 import torch._functorch.aot_autograd as aot_autograd
 import torch._inductor.compile_fx as compile_fx
 from torch._dynamo import config as dynamo_config
+from torch._dynamo.graph_bytecode_inputs import (
+    register_current_stream,
+    register_user_object,
+    reset_user_object_tracking,
+)
+from torch._dynamo.source import ConstantSource
 from torch._dynamo.utils import counters
 from torch._functorch import config as functorch_config
 from torch._functorch._aot_autograd.autograd_cache import (
@@ -3756,6 +3762,48 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         low_again = self.gen_cache_key(make_fn(0.2), config)
         self.assertNotEqual(low, high)
         self.assertEqual(low, low_again)
+
+    @unittest.skipIf(not TEST_CUDA, "CUDA is unavailable")
+    def test_stream_alias_registry_cache_key(self):
+        self.addCleanup(reset_user_object_tracking)
+
+        def fn(x):
+            return x.sin()
+
+        def key(aliases, shift_slots=False, barrier=False):
+            reset_user_object_tracking()
+            if shift_slots:
+                unused = torch.cuda.Stream()
+                register_user_object(unused, ConstantSource("unused_stream"))
+            first = torch.cuda.Stream()
+            second = (
+                torch.cuda.ExternalStream(first.cuda_stream, device=first.device)
+                if aliases
+                else torch.cuda.Stream()
+            )
+            first_index = register_user_object(first, ConstantSource("first_stream"))
+            second_index = register_user_object(second, ConstantSource("second_stream"))
+            if not barrier:
+                register_current_stream(first.device, second_index)
+            gm = torch.fx.experimental.proxy_tensor.make_fx(fn)(torch.ones(3))
+            inputs = [torch.ones(3)]
+            node = next(n for n in gm.graph.nodes if n.op == "call_function")
+            node.meta.setdefault("custom", {})["stream"] = first_index
+            if barrier:
+                with gm.graph.inserting_before(gm.graph.output_node()):
+                    gm.graph.call_function(
+                        torch.ops.streams.synchronize_stream.default, (second_index,)
+                    )
+            shape_env = ShapeEnv()
+            ctx = TracingContext(FakeTensorMode(shape_env=shape_env))
+            with torch._guards.tracing(ctx):
+                return autograd_cache_key(gm, inputs, self.default_config())
+
+        alias = key(True)
+        self.assertEqual(alias, key(True))
+        self.assertNotEqual(alias, key(False))
+        self.assertNotEqual(alias, key(True, shift_slots=True))
+        self.assertNotEqual(key(True, barrier=True), key(False, barrier=True))
 
     def test_region_activation_memory_budget_coverage_config_cache_key(self):
         def fn(x):

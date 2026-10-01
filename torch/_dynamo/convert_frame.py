@@ -130,7 +130,10 @@ from .exc import (
     Unsupported,
     UserError,
 )
-from .graph_bytecode_inputs import reset_user_object_tracking
+from .graph_bytecode_inputs import (
+    restore_user_object_tracking,
+    save_and_reset_user_object_tracking,
+)
 from .guards import (
     CheckFunctionManager,
     get_and_maybe_log_recompilation_reasons,
@@ -368,10 +371,11 @@ def preserve_global_state(fn: Callable[_P, _T]) -> Callable[_P, _T]:
             exit_stack.enter_context(
                 torch.fx._symbolic_trace._maybe_revert_all_patches()
             )
-            reset_user_object_tracking()
+            user_object_state = save_and_reset_user_object_tracking()
             try:
                 return fn(*args, **kwargs)
             finally:
+                restore_user_object_tracking(user_object_state)
                 cleanup.close()
                 exit_stack.close()
                 torch._C._set_grad_enabled(prior_grad_mode)

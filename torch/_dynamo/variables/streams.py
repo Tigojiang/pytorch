@@ -1,6 +1,6 @@
 import collections
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any, cast, Optional
 
 import torch
 from torch._dynamo.variables.dicts import ConstDictVariable
@@ -11,11 +11,11 @@ from .. import graph_break_hints
 from ..bytecode_transformation import create_call_function
 from ..exc import TYPE_CHECKING, unimplemented
 from ..graph_bytecode_inputs import (
+    get_current_stream_index,
     get_external_object_by_index,
     register_current_stream,
     register_graph_created_object,
     register_user_object,
-    reset_user_object_tracking,
 )
 from ..source import CurrentStreamSource
 from .base import GetSet, Method, readonly_setter, VariableTracker
@@ -40,7 +40,8 @@ INPUT_MUTATION_BARRIER_INDICES = "input_mutation_barrier_indices"
 
 def stream_identity(stream: torch.Stream) -> StreamIdentity:
     device = stream.device
-    return device.type, device.index, stream.native_handle
+    native_handle = 0 if device.type == "cpu" else cast(Any, stream).native_handle
+    return device.type, device.index, int(native_handle)
 
 
 def new_event(*args: Any, **kwargs: Any) -> int:
@@ -64,21 +65,19 @@ def new_stream(*args: tuple[Any], **kwargs: Any) -> int:
 
 
 def _codegen_current_stream(device: torch.device, cg: "PyCodegen") -> None:
-    cg.add_push_null(
-        lambda: cg.load_import_from(
-            torch._dynamo.graph_bytecode_inputs.__name__,  # type: ignore[implicit-imports]
-            "stash_graph_created_object",
-        )
-    )
     cg(CurrentStreamSource(device))
-    cg.extend_output(create_call_function(1, False))
 
 
 def get_current_stream(device: torch.device) -> int:
+    index = get_current_stream_index(device)
+    if index is not None:
+        return index
     stream = torch.accelerator.current_stream(device)
-    return register_graph_created_object(
+    index = register_graph_created_object(
         stream, lambda _, cg: _codegen_current_stream(device, cg)
     )
+    register_current_stream(device, index)
+    return index
 
 
 def _get_stream_by_index(index: int) -> torch.Stream:
@@ -282,12 +281,9 @@ class SymbolicStreamState:
         cur_stack: list[StreamVariable] = []
         self.current_streams: dict[torch.device, StreamVariable] = {}
         if torch.accelerator.is_available():
-            reset_user_object_tracking()
             stream_var = self._register_current_stream(
                 torch.accelerator.current_stream()
             )
-            if stream_var.user_object_index != 0:
-                raise AssertionError("Current stream must be registered at index 0")
             cur_stack = [stream_var]
 
         self.cur_stream_stack: collections.deque[StreamVariable] = collections.deque(
@@ -304,7 +300,6 @@ class SymbolicStreamState:
         index = register_user_object(stream, codegen_source)
         register_current_stream(codegen_device, index)
         stream_var = LazyVariableTracker.create(stream, source=codegen_source)
-        # Avoid realizing the lazy variable when stream ops need its registry index.
         stream_var.user_object_index = index  # type: ignore[union-attr]
         self.current_streams[stream.device] = stream_var  # type: ignore[assignment]
         return stream_var  # type: ignore[return-value]
@@ -316,17 +311,26 @@ class SymbolicStreamState:
         self.cur_stream_stack.pop()
 
     def cur_stream(self, device: torch.device | None = None) -> "StreamVariable":
-        if device is not None:
+        if device is None:
+            accelerator = torch.accelerator.current_accelerator()
+            if accelerator is None:
+                raise AssertionError("Current stream requires an accelerator")
+            device = torch.device(
+                accelerator.type, torch.accelerator.current_device_index()
+            )
+        elif device.index is None:
             for stream in reversed(self.cur_stream_stack):
-                if stream.device == device:
+                if stream.device.type == device.type:
                     return stream
+            device = torch.device(device.type, torch.accelerator.current_device_index())
+        for stream in reversed(self.cur_stream_stack):
+            if stream.device == device:
+                return stream
 
-            current = torch.accelerator.current_stream(device)
-            if current.device not in self.current_streams:
-                return self._register_current_stream(current)
-            return self.current_streams[current.device]
-
-        return self.cur_stream_stack[-1]
+        current = torch.accelerator.current_stream(device)
+        if current.device not in self.current_streams:
+            return self._register_current_stream(current)
+        return self.current_streams[current.device]
 
 
 class StreamContextVariable(FxTracebackAnnotateVariable):
@@ -426,8 +430,9 @@ class StreamVariable(StreamContextVariable):
             install_guard(self.source.make_guard(GuardBuilder.EQUALS_MATCH))
         if hasattr(self.value, name):
             return ConstantVariable.create(getattr(self.value, name))
-        if hasattr(self.value, "native_handle"):
-            return ConstantVariable.create(self.value.native_handle)
+        value: Any = self.value
+        if hasattr(value, "native_handle"):
+            return ConstantVariable.create(value.native_handle)
         return None
 
     def get_real_python_backed_value(self) -> object:
@@ -442,12 +447,13 @@ class StreamVariable(StreamContextVariable):
         event_arg = args[0]
         if not isinstance(event_arg, EventVariable):
             raise AssertionError(f"Expected EventVariable, got {type(event_arg)}")
-        tx.output.create_proxy(
+        proxy = tx.output.create_proxy(
             "call_function",
             torch.ops.streams.wait_event,
             (event_arg.user_object_index, self.user_object_index),
             {},
         )
+        tx.output.mark_input_mutation_barrier(proxy.node, (self,))
         return ConstantVariable.create(None)
 
     def wait_stream(
@@ -465,7 +471,7 @@ class StreamVariable(StreamContextVariable):
             (self.user_object_index, other_stream.user_object_index),
             {},
         )
-        tx.output.mark_input_mutation_barrier(proxy.node, (other_stream,))
+        tx.output.mark_input_mutation_barrier(proxy.node, (self, other_stream))
         return ConstantVariable.create(None)
 
     def synchronize(
@@ -583,6 +589,12 @@ class StreamVariable(StreamContextVariable):
         if self.source:
             raise AssertionError("Stream should not have a source during reconstruct")
         if self.user_object_index is not None:
+            local_var = codegen.tx.output.external_object_local_vars.get(
+                self.user_object_index
+            )
+            if local_var is not None:
+                codegen.append_output(codegen.create_load(local_var))
+                return
             codegen.add_push_null(
                 lambda: codegen.load_import_from(
                     torch._dynamo.graph_bytecode_inputs.__name__,
@@ -607,19 +619,12 @@ class StreamVariable(StreamContextVariable):
         def fn(index: int, codegen: "PyCodegen") -> None:
             codegen.add_push_null(
                 lambda: codegen.load_import_from(
-                    torch._dynamo.graph_bytecode_inputs.__name__,  # type: ignore[implicit-imports]
-                    "stash_graph_created_object",
-                )
-            )
-            codegen.add_push_null(
-                lambda: codegen.load_import_from(
                     torch._dynamo.utils.__name__, "build_stream"
                 )
             )
             codegen(args)
             codegen(kwargs)
             codegen.extend_output(create_call_function(2, False))
-            codegen.extend_output(create_call_function(1, False))
 
         return fn
 
@@ -695,8 +700,8 @@ class EventVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
-        _, stream_index = EventVariable._get_stream_arg(tx, args, kwargs)
-        tx.output.create_proxy(
+        stream_arg, stream_index = EventVariable._get_stream_arg(tx, args, kwargs)
+        proxy = tx.output.create_proxy(
             "call_function",
             torch.ops.streams.wait_event,
             (
@@ -705,6 +710,7 @@ class EventVariable(VariableTracker):
             ),
             {},
         )
+        tx.output.mark_input_mutation_barrier(proxy.node, (stream_arg,))
         return ConstantVariable.create(None)
 
     def record(
@@ -804,10 +810,8 @@ class EventVariable(VariableTracker):
     ) -> tuple["StreamVariable", int]:
         """Returns (stream_variable, stream_index_for_op).
 
-        The ambient current stream is registered at index 0 in the external
-        object registry.  The inductor wrapper updates index 0 at runtime so
-        that cudagraph capture sees the capture stream, not the stale
-        trace-time default stream.
+        The current stream is registered per device. Inductor updates that
+        device's slot at runtime so CUDA graph capture observes its stream.
         """
         stream_arg = None
         if args:
@@ -828,19 +832,12 @@ class EventVariable(VariableTracker):
         def fn(index: int, codegen: "PyCodegen") -> None:
             codegen.add_push_null(
                 lambda: codegen.load_import_from(
-                    torch._dynamo.graph_bytecode_inputs.__name__,  # type: ignore[implicit-imports]
-                    "stash_graph_created_object",
-                )
-            )
-            codegen.add_push_null(
-                lambda: codegen.load_import_from(
                     torch._dynamo.utils.__name__, "build_event"
                 )
             )
             codegen(args)
             codegen(kwargs)
             codegen.extend_output(create_call_function(2, False))
-            codegen.extend_output(create_call_function(1, False))
 
         return fn
 
@@ -850,6 +847,12 @@ class EventVariable(VariableTracker):
         if self.source:
             raise AssertionError("Event should not have a source during reconstruct")
         if self.user_object_index is not None:
+            local_var = codegen.tx.output.external_object_local_vars.get(
+                self.user_object_index
+            )
+            if local_var is not None:
+                codegen.append_output(codegen.create_load(local_var))
+                return
             codegen.add_push_null(
                 lambda: codegen.load_import_from(
                     torch._dynamo.graph_bytecode_inputs.__name__,

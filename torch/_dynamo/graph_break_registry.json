@@ -6136,6 +6136,14 @@
       ]
     }
   ],
+  "GB4523": [
+    {
+      "Gb_type": "Input mutation requiring grad before a stream barrier",
+      "Context": "",
+      "Explanation": "A mutation requiring grad must be applied outside the compiled graph before the stream barrier can observe it.",
+      "Hints": []
+    }
+  ],
   "GB0346": [
     {
       "Gb_type": "autograd.Function.apply: non-function or method forward",

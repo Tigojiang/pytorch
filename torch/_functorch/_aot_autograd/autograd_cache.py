@@ -20,10 +20,14 @@ import traceback
 import uuid
 import weakref
 from copy import copy
-from typing import Any, TYPE_CHECKING
+from typing import Any, cast, TYPE_CHECKING
 from typing_extensions import override
 
 import torch
+from torch._dynamo.graph_bytecode_inputs import (
+    get_external_object_by_index,
+    snapshot_current_stream_indices,
+)
 from torch._dynamo.precompile_context import PrecompileContext
 from torch._dynamo.trace_rules import torch_non_c_binding_in_graph_functions
 from torch._dynamo.utils import (
@@ -36,7 +40,7 @@ from torch._dynamo.utils import (
 )
 from torch._dynamo.variables.streams import (
     INPUT_MUTATION_BARRIER_INDICES,
-    INPUT_MUTATION_BARRIER_INPUTS,
+    stream_identity,
 )
 from torch._functorch import config
 from torch._inductor.codecache import (
@@ -620,15 +624,83 @@ class AOTAutogradCacheDetails(FxGraphHashDetails):
             (
                 module_name,
                 node_index,
-                tuple(sorted(node.meta["custom"][INPUT_MUTATION_BARRIER_INPUTS])),
-                tuple(
-                    sorted(node.meta["custom"].get(INPUT_MUTATION_BARRIER_INDICES, ()))
-                ),
+                None
+                if node.meta["custom"][INPUT_MUTATION_BARRIER_INDICES] is None
+                else tuple(sorted(node.meta["custom"][INPUT_MUTATION_BARRIER_INDICES])),
             )
             for module_name, module in gm.named_modules()
             if isinstance(module, torch.fx.GraphModule)
             for node_index, node in enumerate(module.graph.nodes)
-            if INPUT_MUTATION_BARRIER_INPUTS in node.meta.get("custom", {})
+            if INPUT_MUTATION_BARRIER_INDICES in node.meta.get("custom", {})
+        )
+        stream_annotations = tuple(
+            (module_name, node_index, node.meta["custom"]["stream"])
+            for module_name, module in gm.named_modules()
+            if isinstance(module, torch.fx.GraphModule)
+            for node_index, node in enumerate(module.graph.nodes)
+            if "stream" in node.meta.get("custom", {})
+        )
+        current_stream_indices = tuple(
+            sorted(
+                snapshot_current_stream_indices(),
+                key=lambda item: (item[0], -1 if item[1] is None else item[1]),
+            )
+        )
+        indexless_current_streams = {
+            index
+            for _, device_index, index in current_stream_indices
+            if device_index is None
+        }
+        stream_aliases: dict[tuple[str, int | None, int], int] = {}
+
+        def canonical_stream(
+            index: int,
+            device_index: int | None = None,
+            preserve_device: bool = False,
+        ) -> tuple[str, int | None, int] | int:
+            try:
+                value = get_external_object_by_index(index)
+            except AssertionError:
+                return index
+            if not isinstance(value, torch.Stream):
+                return index
+            identity = stream_identity(value)
+            alias = stream_aliases.setdefault(identity, len(stream_aliases))
+            return identity[0], device_index if preserve_device else identity[1], alias
+
+        self.stream_annotations = tuple(
+            (
+                module_name,
+                node_index,
+                index,
+                canonical_stream(
+                    index, preserve_device=index in indexless_current_streams
+                ),
+            )
+            for module_name, node_index, index in stream_annotations
+        )
+        self.current_stream_registry = tuple(
+            (
+                device_type,
+                device_index,
+                index,
+                canonical_stream(index, device_index, preserve_device=True),
+            )
+            for device_type, device_index, index in current_stream_indices
+        )
+
+        stream_operand_positions: dict[object, tuple[int, ...]] = {
+            torch.ops.streams.record_event.default: (1,),
+            torch.ops.streams.wait_event.default: (1,),
+            torch.ops.streams.wait_stream.default: (0, 1),
+            torch.ops.streams.synchronize_stream.default: (0,),
+        }
+        self.stream_barrier_operands = tuple(
+            canonical_stream(cast(int, node.args[position]))
+            for _, module in gm.named_modules()
+            if isinstance(module, torch.fx.GraphModule)
+            for node in module.graph.nodes
+            for position in stream_operand_positions.get(node.target, ())
         )
 
         # Note: We use the live config module, not self.autograd_config (the

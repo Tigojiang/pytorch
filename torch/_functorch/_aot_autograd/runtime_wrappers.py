@@ -28,10 +28,8 @@ from torch._custom_class_base import CustomClassBase
 from torch._dynamo import config as dynamo_config
 from torch._dynamo.callback import callback_handler, CallbackTrigger
 from torch._dynamo.graph_bytecode_inputs import (
-    index_to_external_object_weakref,
-    set_external_object_by_index,
-    snapshot_current_stream_indices,
-    store_current_stream_indices,
+    restore_external_object_state,
+    snapshot_external_object_state,
 )
 from torch._dynamo.utils import (
     CompileEventLogger,
@@ -119,19 +117,21 @@ if typing.TYPE_CHECKING:
 
 
 def _snapshot_external_objects(ctx: Any) -> None:
-    """Snapshot the external object registry onto ctx for backward restore."""
-    ctx._external_object_weakrefs = tuple(index_to_external_object_weakref)
+    (
+        ctx._external_object_weakrefs,
+        current_stream_indices,
+    ) = snapshot_external_object_state()
     ctx._external_objects = {
         k: ref()
-        for k, ref in enumerate(index_to_external_object_weakref)
+        for k, ref in enumerate(ctx._external_object_weakrefs)
         if ref() is not None
     }
-    current_stream_indices = snapshot_current_stream_indices()
     for device_type, device_index, index in current_stream_indices:
         if index not in ctx._external_objects:
-            ctx._external_objects[index] = torch.accelerator.current_stream(
-                torch.device(device_type, device_index)
-            )
+            device = torch.device(device_type)
+            if device_index is not None:
+                device = torch.device(device_type, typing.cast(int, device_index))
+            ctx._external_objects[index] = torch.accelerator.current_stream(device)
     ctx._external_stream_indices = current_stream_indices
 
 
@@ -3666,19 +3666,17 @@ class _AOTDispatchAutogradFunctionFactory:
                         ),
                     )
 
-                if hasattr(ctx, "_external_object_weakrefs"):
-                    index_to_external_object_weakref[:] = ctx._external_object_weakrefs
-                for idx, obj in getattr(ctx, "_external_objects", {}).items():
-                    set_external_object_by_index(idx, obj)
-                if hasattr(ctx, "_external_stream_indices"):
-                    store_current_stream_indices(ctx._external_stream_indices)
-
-                return call_func_at_runtime_with_args(
-                    compiled_bw,
-                    all_args,
-                    steal_args=True,
-                    disable_amp=disable_amp,
-                )
+                with restore_external_object_state(
+                    ctx._external_object_weakrefs,
+                    ctx._external_objects,
+                    ctx._external_stream_indices,
+                ):
+                    return call_func_at_runtime_with_args(
+                        compiled_bw,
+                        all_args,
+                        steal_args=True,
+                        disable_amp=disable_amp,
+                    )
 
         return CompiledFunction
 

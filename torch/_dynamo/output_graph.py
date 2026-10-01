@@ -116,9 +116,10 @@ from .exc import (
     unimplemented_with_warning,
 )
 from .graph_bytecode_inputs import (
-    has_user_objects,
-    index_to_bytecode_constructor,
+    call_with_external_object_state,
+    snapshot_bytecode_constructors,
     snapshot_current_stream_indices,
+    wrap_with_additional_external_object_state,
 )
 from .graph_deduplication import apply_graph_deduplication
 from .graph_id_filter import (
@@ -134,6 +135,7 @@ from .source import (
     AttrSource,
     BackwardStateSource,
     ConstantSource,
+    CurrentStreamSource,
     DictGetItemSource,
     GetItemSource,
     GlobalStateSource,
@@ -210,7 +212,7 @@ RootGuardManager = guards.RootGuardManager
 TensorMetadataDim = int | torch.SymInt | None
 TensorMetadataSequence = Sequence[TensorMetadataDim]
 OutputReturnKind = Literal["graph_out", "input", "constant"]
-InputMutation = tuple[traceback.StackSummary, OrderedSet[Source | None]]
+InputMutation = tuple[traceback.StackSummary, OrderedSet[Source | None], bool]
 InputMutations = dict[str, tuple[InputMutation, ...]]
 
 
@@ -221,8 +223,6 @@ def _fake_tensors_overlap(first: Any, second: Any) -> bool:
         and torch._C._is_alias_of(first, second)
     ):
         return False
-    if first.element_size() != second.element_size():
-        return True
     symbolic = any(
         isinstance(value, torch.SymInt)
         for tensor in (first, second)
@@ -906,8 +906,6 @@ class OutputGraph(OutputGraphCommon):
         # and restore_graphstate
         self.timestamp = 0
 
-        # Maps input source names and runtime streams to mutation stacks and
-        # sources. Distinct wrappers can represent one stream.
         self._input_mutation_streams: dict[
             str,
             dict[tuple[str, int | None, int], InputMutation],
@@ -915,6 +913,7 @@ class OutputGraph(OutputGraphCommon):
         self._input_mutation_candidates: dict[
             StorageWeakRef, list[tuple[torch.Tensor, Source]]
         ] = collections.defaultdict(list)
+        self.external_object_local_vars: dict[int, str] = {}
 
         # A list of register_finalizer_fns to apply to the output graph module
         self.register_finalizer_fns: list[Callable[[fx.GraphModule], None]] = []
@@ -1396,8 +1395,18 @@ class OutputGraph(OutputGraphCommon):
                     source.name, {}
                 )
                 mutation = input_mutations.get(cur_stream_key)
+                needs_graph_break = (
+                    mutated_value.requires_grad or example_value.requires_grad
+                ) and torch.is_grad_enabled()
                 if mutation is None:
-                    mutation = (TracingContext.extract_stack(), OrderedSet())
+                    mutation = (
+                        TracingContext.extract_stack(),
+                        OrderedSet(),
+                        needs_graph_break,
+                    )
+                    input_mutations[cur_stream_key] = mutation
+                elif needs_graph_break and not mutation[2]:
+                    mutation = (mutation[0], mutation[1], True)
                     input_mutations[cur_stream_key] = mutation
                 mutation[1].add(cur_stream.source)
 
@@ -1431,46 +1440,55 @@ class OutputGraph(OutputGraphCommon):
 
         from .variables.streams import stream_identity
 
+        result: InputMutations = {}
         if streams:
             matching_streams = {stream_identity(stream.value) for stream in streams}
+            current_barrier_devices = {
+                (stream.device.type, stream.device.index)
+                for stream in streams
+                if isinstance(stream.source, CurrentStreamSource)
+            }
             sources = [stream.source for stream in streams]
-            sources.extend(
-                source
-                for input_mutations in self._input_mutation_streams.values()
-                for _, mutation_sources in input_mutations.values()
-                for source in mutation_sources
-            )
+            for input_name, input_mutations in self._input_mutation_streams.items():
+                matched_mutations = []
+                for identity, mutation in input_mutations.items():
+                    mutation_sources = mutation[1]
+                    sources.extend(mutation_sources)
+                    matches_current = identity[:2] in current_barrier_devices and any(
+                        isinstance(source, CurrentStreamSource)
+                        for source in mutation_sources
+                    )
+                    if identity in matching_streams or matches_current:
+                        matched_mutations.append(mutation)
+                if matched_mutations:
+                    result[input_name] = tuple(matched_mutations)
             for source in sources:
-                if source is not None:
+                if source is not None and not isinstance(source, CurrentStreamSource):
                     install_guard(source.make_guard(GuardBuilder.EQUALS_MATCH))
         else:
             if device is None:
                 raise AssertionError("A barrier must specify streams or a device")
             from torch.fx.experimental.proxy_tensor import _coor_device_index_is_current
 
-            matching_streams = {
-                identity
-                for input_mutations in self._input_mutation_streams.values()
-                for identity in input_mutations
-                if identity[0] == device.type
-                and (
-                    identity[1] == device.index
-                    or (
-                        device.index is None
-                        and _coor_device_index_is_current(torch.device(*identity[:2]))
+            for input_name, input_mutations in self._input_mutation_streams.items():
+                device_matches = tuple(
+                    mutation
+                    for identity, mutation in input_mutations.items()
+                    if identity[0] == device.type
+                    and (
+                        identity[1] == device.index
+                        or (
+                            device.index is None
+                            and _coor_device_index_is_current(
+                                torch.device(*identity[:2])
+                            )
+                        )
                     )
                 )
-            }
+                if device_matches:
+                    result[input_name] = device_matches
 
-        return {
-            input_name: tuple(
-                mutation
-                for identity, mutation in input_mutations.items()
-                if identity in matching_streams
-            )
-            for input_name, input_mutations in self._input_mutation_streams.items()
-            if any(identity in matching_streams for identity in input_mutations)
-        }
+        return result
 
     def mark_input_mutation_barrier(
         self,
@@ -1484,6 +1502,20 @@ class OutputGraph(OutputGraphCommon):
 
         if mutation_inputs is None:
             mutation_inputs = self.input_mutation_barrier_inputs(streams, device=device)
+        if any(
+            requires_grad_mutation
+            for mutations in mutation_inputs.values()
+            for _, _, requires_grad_mutation in mutations
+        ):
+            unimplemented(
+                gb_type="Input mutation requiring grad before a stream barrier",
+                context="",
+                explanation=(
+                    "A mutation requiring grad must be applied outside the compiled "
+                    "graph before the stream barrier can observe it."
+                ),
+                hints=[],
+            )
         barrier.meta.setdefault("custom", {})[INPUT_MUTATION_BARRIER_INPUTS] = (
             frozenset(mutation_inputs)
         )
@@ -1511,7 +1543,7 @@ class OutputGraph(OutputGraphCommon):
             return
 
         mutation_stack = next(
-            stack for mutations in input_mutations.values() for stack, _ in mutations
+            stack for mutations in input_mutations.values() for stack, _, _ in mutations
         )
         record_stack = TracingContext.extract_stack()
 
@@ -2383,6 +2415,10 @@ class OutputGraph(OutputGraphCommon):
             # function output will be moved to the correct places below
         else:
             graph_output_var = self.new_var("graph_out")
+            self.external_object_local_vars = {
+                index: self.new_var()
+                for index, _ in enumerate(snapshot_bytecode_constructors())
+            }
             # load stack values in a flat manner - we will codegen bytecode to place them correctly
             # according to our convention above
             pass1 = PyCodegen(
@@ -3227,7 +3263,11 @@ class OutputGraph(OutputGraphCommon):
             counters["stats"]["unique_graphs"] += 1
             if old_fake_mode.shape_env is None:
                 raise AssertionError("old_fake_mode.shape_env must not be None")
+            bytecode_constructors = snapshot_bytecode_constructors()
+            external_object_count = len(bytecode_constructors)
+            current_stream_indices = snapshot_current_stream_indices()
             if specializations := old_fake_mode.shape_env.specializations:
+                default_compiled_fn = compiled_fn
                 specialization_guards = []
                 specialization_cache: dict[Specialization, Callable[[Any], Any]] = {}
                 sources = [a.source for a in self.graphargs]
@@ -3277,66 +3317,51 @@ class OutputGraph(OutputGraphCommon):
                                 example_inputs: list[Tensor] = list(args)
                                 with tracing(self.tracing_context):
                                     specialization_cache[specialization] = (
-                                        self.call_user_compiler(gm, example_inputs)
+                                        wrap_with_additional_external_object_state(
+                                            self.call_user_compiler(gm, example_inputs),
+                                            external_object_count,
+                                        )
                                     )
 
                             return specialization_cache[specialization](*args, **kwargs)
-                    return compiled_fn(*args, **kwargs)
+                    return default_compiled_fn(*args, **kwargs)
 
-                # This is safe because we pre-process name to be unique
-                self.install_global_unsafe(name, specialized_dispatch)
-            else:
-                # This is safe because we pre-process name to be unique
-                self.install_global_unsafe(name, compiled_fn)
+                compiled_fn = specialized_dispatch
+
+            if bytecode_constructors:
+                compiled_fn = functools.partial(
+                    call_with_external_object_state,
+                    compiled_fn,
+                    current_stream_indices,
+                    len(bytecode_constructors),
+                )
+
+            # This is safe because we pre-process name to be unique
+            self.install_global_unsafe(name, compiled_fn)
 
             if self.root_tx is None:
                 raise AssertionError("root_tx must not be None")
             cg = PyCodegen(self.root_tx)
 
-            if has_user_objects():
-                # NB: This is where we store possible user objects before running the graph
-                # index_to_user_object_weakref is the function used in the graph to translate
-                # the dynamo-generated index into the actual object passed to the compiled function.
-                # We generate bytecode to store all user objects at the proper index in the below
-                # call.
-                cg.add_push_null(
-                    lambda: cg.load_import_from(
-                        torch._dynamo.graph_bytecode_inputs.__name__,
-                        "store_user_object_weakrefs",
-                    )
-                )
-
-                tmp_vars = []
-                for constructor in index_to_bytecode_constructor:
+            tmp_vars = []
+            if bytecode_constructors:
+                for index, constructor in enumerate(bytecode_constructors):
                     constructor(cg)
                     var_name = (
-                        self.new_var()
-                    )  # keep alive any user objects for the rest of the frame
+                        self.external_object_local_vars[index]
+                        if index in self.external_object_local_vars
+                        else self.new_var()
+                    )
+                    # keep alive any user objects for the rest of the frame
                     # TODO: we could omit this for objects we create but shouldn't be too much overhead for now
                     cg.store(var_name)
                     tmp_vars.append(var_name)
-
-                for var_name in tmp_vars:
-                    cg.append_output(cg.create_load(var_name))
-
-                cg.call_function(len(index_to_bytecode_constructor), False)
-                cg.pop_top()
-
-                cg.add_push_null(
-                    lambda: cg.load_import_from(
-                        torch._dynamo.graph_bytecode_inputs.__name__,
-                        "store_current_stream_indices",
-                    )
-                )
-                current_stream_indices = snapshot_current_stream_indices()
-                cg.append_output(cg.create_load_const(current_stream_indices))
-                cg.call_function(1, False)
-                cg.pop_top()
+                    self.external_object_local_vars[index] = var_name
 
             for idx, arg in enumerate(self.graphargs):
                 self.export_metadata.graph_input_idx_to_local_source[idx] = arg.source
 
-            cg.make_call_generated_code(name)
+            cg.make_call_generated_code(name, tmp_vars)
 
             return cg.get_instructions(), cg.get_pycode()
 

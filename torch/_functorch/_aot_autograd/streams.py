@@ -5,7 +5,10 @@ from typing import Any, TYPE_CHECKING, TypeAlias
 import torch.fx
 import torch.fx.traceback
 import torch.utils._pytree as pytree
-from torch._dynamo.graph_bytecode_inputs import get_external_object_by_index
+from torch._dynamo.graph_bytecode_inputs import (
+    get_current_stream_index,
+    get_external_object_by_index,
+)
 from torch._dynamo.graph_utils import _get_flat_args
 from torch._dynamo.variables.streams import (
     get_current_stream,
@@ -14,6 +17,7 @@ from torch._dynamo.variables.streams import (
     new_event,
     stream_identity,
 )
+from torch._subclasses.fake_tensor import UnsupportedMutationAliasingException
 from torch.fx.experimental.proxy_tensor import _coor_device_index_is_current
 from torch.fx.node import map_arg
 from torch.utils._ordered_set import OrderedSet
@@ -40,7 +44,7 @@ Partition: TypeAlias = bool
 
 FORWARD: Partition = False
 BACKWARD: Partition = True
-_EMPTY_LOCATIONS: frozenset[tuple[Partition, int]] = frozenset()
+_EMPTY_LOCATIONS: frozenset[tuple[Partition, int | None]] = frozenset()
 
 _SYNC_OPS = (
     torch.ops.streams.record_event.default,
@@ -53,6 +57,7 @@ _SYNC_OPS = (
 
 _EPILOGUE_COPY_BARRIERS = (
     torch.ops.streams.record_event.default,
+    torch.ops.streams.wait_event.default,
     torch.ops.streams.wait_stream.default,
     torch.ops.streams.synchronize_device.default,
     torch.ops.streams.synchronize_stream.default,
@@ -345,6 +350,38 @@ def sync_deallocations(gm: torch.fx.GraphModule) -> None:
                 )
 
 
+def _stream_index_may_order(
+    barrier_stream: object,
+    stream: int | None,
+    device: torch.device,
+) -> bool:
+    if not isinstance(barrier_stream, int):
+        return True
+    try:
+        barrier_value = get_external_object_by_index(barrier_stream)
+    except AssertionError:
+        return True
+    if not isinstance(barrier_value, torch.Stream):
+        return True
+    if barrier_value.device != device:
+        return False
+    if stream is None:
+        return True
+    stream_index = stream
+    if barrier_stream == stream:
+        return True
+    current_stream = get_current_stream_index(device)
+    if current_stream == barrier_stream:
+        return True
+    try:
+        stream_value = get_external_object_by_index(stream_index)
+    except AssertionError:
+        return True
+    if not isinstance(stream_value, torch.Stream):
+        return True
+    return bool(stream_identity(barrier_value) == stream_identity(stream_value))
+
+
 def _barrier_may_order_stream(
     barrier: Node,
     stream: int | None,
@@ -354,36 +391,34 @@ def _barrier_may_order_stream(
     has_writeback: bool = False,
 ) -> bool:
     custom = barrier.meta.get("custom", {})
-    mutation_inputs = custom.get(INPUT_MUTATION_BARRIER_INPUTS)
     mutation_indices = custom.get(INPUT_MUTATION_BARRIER_INDICES)
-    if mutation_inputs == frozenset() and not has_writeback:
-        return False
     if mutation_indices and input_indices:
-        return not mutation_indices.isdisjoint(input_indices)
+        if not mutation_indices.isdisjoint(input_indices):
+            return True
+    if not has_writeback:
+        return False
 
     if barrier.target in (
         torch.ops.streams.record_event.default,
+        torch.ops.streams.wait_event.default,
         torch.ops.streams.wait_stream.default,
         torch.ops.streams.synchronize_stream.default,
     ):
-        barrier_stream = barrier.args[
-            1 if barrier.target is torch.ops.streams.wait_stream.default else -1
-        ]
-        stream = get_current_stream(device) if stream is None else stream
-        if barrier_stream == stream:
-            return True
-        try:
-            barrier_value = get_external_object_by_index(barrier_stream)
-            stream_value = get_external_object_by_index(stream)
-        except (AssertionError, TypeError):
-            return True
-        if not isinstance(barrier_value, torch.Stream) or not isinstance(
-            stream_value, torch.Stream
-        ):
-            return True
-        return stream_identity(barrier_value) == stream_identity(stream_value)
+        barrier_streams = (
+            barrier.args
+            if barrier.target is torch.ops.streams.wait_stream.default
+            else (barrier.args[-1],)
+        )
+        return any(
+            _stream_index_may_order(barrier_stream, stream, device)
+            for barrier_stream in barrier_streams
+        )
     if barrier.target is torch.ops.streams.synchronize_device.default:
         barrier_type, barrier_index = barrier.args
+        if not isinstance(barrier_type, str) or (
+            barrier_index is not None and not isinstance(barrier_index, int)
+        ):
+            return True
         return barrier_type == device.type and (
             barrier_index == device.index
             or (barrier_index is None and _coor_device_index_is_current(device))
@@ -436,10 +471,11 @@ def assign_epilogue_copy_streams(
                         mutation_stream,
                         device,
                         desc.mutated_input.dynamo_input_indices,
+                        has_writeback=node_positions[mutation] < barrier_pos,
                     )
-                    for _, barrier in barriers
+                    for barrier_pos, barrier in barriers
                 ):
-                    raise RuntimeError(
+                    raise UnsupportedMutationAliasingException(
                         "An out-of-graph input mutation cannot be ordered before a stream "
                         "barrier inside the compiled region. Move the barrier after the "
                         "compiled function call."
@@ -456,8 +492,6 @@ def assign_epilogue_copy_streams(
         if not barriers or device.type == "cpu":
             continue
 
-        # A barrier only covers work already submitted to the synchronized stream.
-        # Keep a functionalized mutation's write-back ahead of the first such barrier.
         source_pos = node_positions[copy_source]
         copy_pos = node_positions[epi_copy]
         copy_is_backward = is_bwd_node(epi_copy)
@@ -479,7 +513,7 @@ def assign_epilogue_copy_streams(
             ):
                 continue
             if barrier_pos <= source_pos:
-                raise RuntimeError(
+                raise UnsupportedMutationAliasingException(
                     "A functionalized input mutation spans a stream barrier and "
                     "cannot be safely written back inside the compiled region."
                 )
@@ -487,7 +521,7 @@ def assign_epilogue_copy_streams(
 
         if candidate_barriers:
             if copy_is_backward:
-                raise RuntimeError(
+                raise UnsupportedMutationAliasingException(
                     "A backward input mutation cannot be ordered before a stream "
                     "barrier inside the compiled region. Move the barrier after the "
                     "compiled backward call."
@@ -747,8 +781,6 @@ def _wrap_sync_node(
                 and user.target is torch.ops.aten.copy_.default
                 and user.args[0] is dep
             ):
-                # AOT functionalization copy_ nodes must keep writing directly
-                # to their input placeholder, including across unrelated barriers.
                 user.args = (dep, *map_arg(user.args[1:], _replace))
             else:
                 user.args = map_arg(user.args, _replace)
@@ -783,18 +815,18 @@ def _collect_sync_forward_deps(
     """
     stream_sync_deps: dict[Node, OrderedSet[Node]] = {}
     full_barrier_deps: dict[Node, OrderedSet[Node]] = {}
-    live_inputs: dict[Partition, dict[int, OrderedSet[Node]]] = {
+    live_inputs: dict[Partition, dict[int | None, OrderedSet[Node]]] = {
         FORWARD: {},
         BACKWARD: {},
     }
-    locations: dict[Node, OrderedSet[tuple[Partition, int]]] = {}
+    locations: dict[Node, OrderedSet[tuple[Partition, int | None]]] = {}
     full_barriers = (
         torch.ops.streams.synchronize_device.default,
         torch.ops.streams.synchronize_event.default,
         torch.ops.streams.synchronize_stream.default,
     )
 
-    def _add_live(node: Node, partition: Partition, stream: int) -> None:
+    def _add_live(node: Node, partition: Partition, stream: int | None) -> None:
         stream_inputs = live_inputs[partition].get(stream)
         if stream_inputs is None:
             stream_inputs = live_inputs[partition][stream] = OrderedSet()
@@ -828,16 +860,26 @@ def _collect_sync_forward_deps(
             and node.target is torch.ops.streams.wait_stream.default
         ):
             waiting_stream: int = node.args[0]  # type: ignore[assignment]
-            deps = live_inputs[is_bwd_node(node)].get(waiting_stream)
+            partition_inputs = live_inputs[is_bwd_node(node)]
+            deps = OrderedSet(
+                (
+                    *partition_inputs.get(waiting_stream, ()),
+                    *partition_inputs.get(None, ()),
+                )
+            )
             if deps:
-                stream_sync_deps[node] = deps.copy()
+                stream_sync_deps[node] = deps
             continue
         if (
             node.op == "call_function"
             and node.target is torch.ops.streams.wait_event.default
         ):
             waiting_stream: int = node.args[1]  # type: ignore[assignment]
-            deps = live_inputs[is_bwd_node(node)].get(waiting_stream, ())
+            partition_inputs = live_inputs[is_bwd_node(node)]
+            deps = (
+                *partition_inputs.get(waiting_stream, ()),
+                *partition_inputs.get(None, ()),
+            )
             graph_inputs = OrderedSet(dep for dep in deps if dep.op == "placeholder")
             if graph_inputs:
                 stream_sync_deps[node] = graph_inputs
@@ -846,10 +888,24 @@ def _collect_sync_forward_deps(
             continue
 
         execution_stream = get_stream(node)
-        if execution_stream is None:
-            execution_stream = 0
-        target_locations = OrderedSet(
-            (*inherited_locations, (is_bwd_node(node), execution_stream))
+        values = pytree.tree_leaves(node.meta.get("val"))
+        values.extend(
+            pytree.tree_leaves(
+                map_arg((node.args, node.kwargs), lambda n: n.meta.get("val"))
+            )
+        )
+        devices = OrderedSet(
+            value.device
+            for value in values
+            if isinstance(value, torch.Tensor) and value.device.type != "cpu"
+        )
+        if execution_stream is not None or not devices:
+            execution_streams = (execution_stream,)
+        else:
+            execution_streams = tuple(get_current_stream_index(d) for d in devices)
+        target_locations = OrderedSet(inherited_locations)
+        target_locations.update(
+            (is_bwd_node(node), stream) for stream in execution_streams
         )
 
         def _collect(n: Node) -> Node:

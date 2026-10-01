@@ -347,13 +347,19 @@ def _try_get_metadata_from_dynamo(
     )
 
     for node in mod.graph.nodes:
-        input_names = node.meta.get("custom", {}).get(INPUT_MUTATION_BARRIER_INPUTS)
+        custom = node.meta.get("custom", {})
+        input_names = custom.get(INPUT_MUTATION_BARRIER_INPUTS)
         if input_names is not None:
-            node.meta["custom"][INPUT_MUTATION_BARRIER_INDICES] = frozenset(
-                input_index
-                for input_name in input_names
-                for input_index in source_name_to_input_indices.get(input_name, ())
+            custom[INPUT_MUTATION_BARRIER_INDICES] = (
+                frozenset(
+                    input_index
+                    for input_name in input_names
+                    for input_index in source_name_to_input_indices[input_name]
+                )
+                if all(name in source_name_to_input_indices for name in input_names)
+                else None
             )
+            del custom[INPUT_MUTATION_BARRIER_INPUTS]
     return aot_autograd_arg_pos_to_source, static_input_indices
 
 

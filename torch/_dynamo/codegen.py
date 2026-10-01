@@ -16,7 +16,7 @@ import re
 import sys
 import types
 from collections import Counter, deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any, TYPE_CHECKING, Union
 
 import torch.nn
@@ -714,9 +714,14 @@ class PyCodegen:
         if source not in self.tempvars:
             self.tempvars[source] = None
 
-    def make_call_generated_code(self, fn_name: str) -> None:
+    def make_call_generated_code(
+        self, fn_name: str, prefix_args: Sequence[str] = ()
+    ) -> None:
         """Call the generated code function stored in fn_name"""
         self.extend_output(self.load_function_name(fn_name, True))
+
+        for arg in prefix_args:
+            self.append_output(self.create_load(arg))
 
         graphargs = self.tx.output.graphargs
 
@@ -836,9 +841,11 @@ class PyCodegen:
             # noreturn leaves the template's implicit `return None` on the stack.
             self.pop_top()
 
-        self.extend_output(create_call_function(len(graphargs), False))
+        self.extend_output(
+            create_call_function(len(prefix_args) + len(graphargs), False)
+        )
         self.add_pycode(
-            f"__graph_out = {fn_name}({', '.join(arg_varnames)})",
+            f"__graph_out = {fn_name}({', '.join((*prefix_args, *arg_varnames))})",
         )
 
     def create_import_name(self, module_name: str) -> Instruction:

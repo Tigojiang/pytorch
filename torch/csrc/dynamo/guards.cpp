@@ -46,6 +46,7 @@
 
 #include <chrono>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <tuple>
@@ -1542,6 +1543,59 @@ struct DynamicMeta {
   }
 };
 
+static bool strided_tensors_definitely_do_not_overlap(
+    const Tensor& x,
+    const Tensor& y) {
+  const auto x_offset = x.sym_storage_offset().maybe_as_int();
+  const auto y_offset = y.sym_storage_offset().maybe_as_int();
+  if (!x_offset || !y_offset) {
+    return false;
+  }
+  int64_t byte_stride_gcd = 0;
+  for (const auto* tensor : {&x, &y}) {
+    const auto element_size = static_cast<int64_t>(tensor->element_size());
+    for (const auto dim : c10::irange(tensor->dim())) {
+      const auto stride = tensor->sym_stride(dim).maybe_as_int();
+      if (!stride) {
+        return false;
+      }
+      byte_stride_gcd = std::gcd(byte_stride_gcd, *stride * element_size);
+    }
+  }
+  if (byte_stride_gcd == 0) {
+    return false;
+  }
+  const auto x0 = *x_offset * static_cast<int64_t>(x.element_size());
+  const auto y0 = *y_offset * static_cast<int64_t>(y.element_size());
+  const auto delta =
+      ((y0 - x0) % byte_stride_gcd + byte_stride_gcd) % byte_stride_gcd;
+  if (delta >= static_cast<int64_t>(x.element_size()) &&
+      byte_stride_gcd - delta >= static_cast<int64_t>(y.element_size())) {
+    return true;
+  }
+  if (x.dim() != 1 || y.dim() != 1) {
+    return false;
+  }
+  const auto x_numel = x.sym_numel().maybe_as_int();
+  const auto y_numel = y.sym_numel().maybe_as_int();
+  if (!x_numel || !y_numel || *x_numel > 256 || *y_numel > 256 - *x_numel) {
+    return false;
+  }
+  for (const auto i : c10::irange(*x_numel)) {
+    const auto x_start =
+        (*x_offset + i * x.stride(0)) * static_cast<int64_t>(x.element_size());
+    for (const auto j : c10::irange(*y_numel)) {
+      const auto y_start = (*y_offset + j * y.stride(0)) *
+          static_cast<int64_t>(y.element_size());
+      if (x_start < y_start + static_cast<int64_t>(y.element_size()) &&
+          y_start < x_start + static_cast<int64_t>(x.element_size())) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 /**
  * Assumption: x and y are known to share a storage, and we are trying to
  * determine if their memory is actually completely disjoint, based on
@@ -1562,6 +1616,26 @@ bool tensors_definitely_do_not_overlap(const Tensor& x, const Tensor& y) {
     return true;
   }
 
+  auto byte_end = [](const Tensor& tensor) {
+    auto offset = Meta::storage_offset(tensor);
+    for (const auto dim : c10::irange(tensor.dim())) {
+      offset += (Meta::size(tensor, dim) - 1) * Meta::stride(tensor, dim);
+    }
+    return (offset + 1) * static_cast<int64_t>(tensor.element_size());
+  };
+  if (byte_end(x) <=
+          Meta::storage_offset(y) * static_cast<int64_t>(y.element_size()) ||
+      byte_end(y) <=
+          Meta::storage_offset(x) * static_cast<int64_t>(x.element_size())) {
+    return true;
+  }
+  if (strided_tensors_definitely_do_not_overlap(x, y)) {
+    return true;
+  }
+  if (x.element_size() != y.element_size()) {
+    return false;
+  }
+
   // Make x always on the left
   if (Meta::storage_offset(x) > Meta::storage_offset(y)) {
     return tensors_definitely_do_not_overlap<Meta>(y, x);
@@ -1570,23 +1644,7 @@ bool tensors_definitely_do_not_overlap(const Tensor& x, const Tensor& y) {
   // Short-circuit in the "obvious" overlapping case: both tensors are
   // contiguous
   if (x.is_contiguous() && y.is_contiguous()) {
-    if (Meta::storage_offset(x) + Meta::numel(x) > Meta::storage_offset(y)) {
-      // definitely overlap
-      return false;
-    } else {
-      // definitely no overlap
-      return true;
-    }
-  }
-
-  // Short-circuit: if last memory address of x is < start of y, then not
-  // overlapping.
-  auto x_last = Meta::storage_offset(x);
-  for (int64_t i = 0; i < x.dim(); i++) {
-    x_last += (Meta::size(x, i) - 1) * Meta::stride(x, i);
-  }
-  if (x_last < Meta::storage_offset(y)) {
-    return true;
+    return false;
   }
 
   if (x.dim() == 2 && y.dim() == 2 && Meta::stride(x, 1) == 1 &&
