@@ -242,7 +242,9 @@ from .functions import (
     LocalGeneratorFunctionVariable,
     MemberDescriptorVariable,
     MethodWrapperVariable,
+    PolyfilledFunctionVariable,
     PropertyVariable,
+    SkipFunctionVariable,
     SysFunctionVariable,
     TritonKernelVariable,
     TritonSetAllocatorVariable,
@@ -343,6 +345,7 @@ from .user_defined import (
     MutableMappingVariable,
     SimpleNamespaceVariable,
     SourcelessGraphModuleVariable,
+    ThreadLocalVariable,
     UserDefinedClassVariable,
     UserDefinedConstantVariable,
     UserDefinedDefaultDictVariable,
@@ -942,6 +945,9 @@ class VariableBuilder:
             UserDefinedObjectVariable,
             NumpyNdarrayVariable,
             CustomClassObjectVariable,
+            UserFunctionVariable,
+            SkipFunctionVariable,
+            PolyfilledFunctionVariable,
         }
 
     def get_source(self) -> Source:
@@ -2436,6 +2442,12 @@ class VariableBuilder:
             result = GenericContextWrappingVariable(value, source=self.source)
         elif SimpleNamespaceVariable.is_matching_cls(type(value)):
             result = SimpleNamespaceVariable(value, source=self.source)
+        elif ThreadLocalVariable.is_matching_cls(type(value)):
+            # Its own __getattribute__ slot keeps it out of the mutation gate
+            # below, but writes are modelled, so register it here.
+            return self.tx.output.side_effects.track_object_existing(
+                value, ThreadLocalVariable(value, source=self.source)
+            )
         else:
             result = UserDefinedObjectVariable(value, source=self.source)
         if not SideEffects.cls_supports_mutation_side_effects(type(value)):
