@@ -108,7 +108,7 @@ case "$tag" in
     ;;
   pytorch-linux-jammy-cuda13.2-cudnn9-py3-gcc11)
     CUDA_VERSION=13.2.2
-    ANACONDA_PYTHON_VERSION=3.10
+    ANACONDA_PYTHON_VERSION=3.11
     GCC_VERSION=11
     KATEX=yes
     TRITON=yes
@@ -116,7 +116,7 @@ case "$tag" in
     ;;
   pytorch-linux-jammy-cuda13.2-cudnn9-py3-gcc11-inductor-benchmarks)
     CUDA_VERSION=13.2.2
-    ANACONDA_PYTHON_VERSION=3.10
+    ANACONDA_PYTHON_VERSION=3.11
     GCC_VERSION=11
     KATEX=yes
     TRITON=yes
@@ -132,7 +132,7 @@ case "$tag" in
     ;;
   pytorch-linux-jammy-cuda13.4-cudnn9-py3-gcc11)
     CUDA_VERSION=13.4.1
-    ANACONDA_PYTHON_VERSION=3.10
+    ANACONDA_PYTHON_VERSION=3.11
     GCC_VERSION=11
     KATEX=yes
     TRITON=yes
@@ -140,7 +140,7 @@ case "$tag" in
     ;;
   pytorch-linux-jammy-cuda13.4-cudnn9-py3-gcc11-inductor-benchmarks)
     CUDA_VERSION=13.4.1
-    ANACONDA_PYTHON_VERSION=3.10
+    ANACONDA_PYTHON_VERSION=3.11
     GCC_VERSION=11
     KATEX=yes
     TRITON=yes
@@ -202,7 +202,7 @@ case "$tag" in
     ;;
   pytorch-linux-jammy-rocm-n-py3 | pytorch-linux-jammy-rocm-n-py3-benchmarks | pytorch-linux-noble-rocm-n-py3.11)
     if [[ $tag =~ "jammy" ]]; then
-      ANACONDA_PYTHON_VERSION=3.10
+      ANACONDA_PYTHON_VERSION=3.11
     else
       ANACONDA_PYTHON_VERSION=3.11
     fi
