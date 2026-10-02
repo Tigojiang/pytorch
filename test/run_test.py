@@ -98,6 +98,15 @@ except ImportError:
         pass
 
 
+try:
+    from torch.testing._internal.test_report import finalize_report, report_path
+
+    HAS_TEST_REPORT = True
+except ImportError:
+    # The installed torch predates the report writer (tests sometimes run
+    # against a nightly), so no report is requested or finalized.
+    HAS_TEST_REPORT = False
+
 from torch.testing._internal.common_utils import HardwareClassification
 
 
@@ -597,6 +606,13 @@ def run_test(
         replacement = {"-f": "-x", "-dist=loadfile": "--dist=loadfile"}
         unittest_args = [replacement.get(arg, arg) for arg in unittest_args]
 
+    if is_cpp_test and IS_CI and HAS_TEST_REPORT:
+        # Python tests pick their report path in common_utils.run_tests; C++
+        # tests run pytest directly, so it is picked here.
+        report = report_path(REPO_ROOT / "test" / "test-reports", test_file)
+        plugin = "torch.testing._internal.test_report"
+        unittest_args += ["-p", plugin, f"--report-xml={report}"]
+
     if options.hw_classification:
         # forward hw classification filter to test subprocess
         unittest_args += ["--hw-classification"] + options.hw_classification
@@ -813,16 +829,31 @@ def run_test_retries(
         print(s, file=output, flush=True)
 
     num_failures = defaultdict(int)
+    cache_dir = REPO_ROOT / ".pytest_cache/v/cache/stepcurrent" / stepcurrent_key
 
     def read_pytest_cache(key: str) -> Any:
-        cache_file = (
-            REPO_ROOT / ".pytest_cache/v/cache/stepcurrent" / stepcurrent_key / key
-        )
         try:
-            with open(cache_file) as f:
+            with open(cache_dir / key) as f:
                 return f.read()
         except FileNotFoundError:
             return None
+
+    def close_report(ret_code: int, signal_name: str) -> None:
+        # The report writer (torch/testing/_internal/test_report.py) publishes its
+        # path and the running test here; a process that died left the report
+        # open and that test unrecorded.
+        report_path = read_pytest_cache("report_path")
+        if not HAS_TEST_REPORT or report_path is None:
+            return
+        inflight = read_pytest_cache("report_inflight")
+        finalize_report(
+            json.loads(report_path),
+            json.loads(inflight) if inflight is not None else None,
+            "timed_out" if ret_code == 124 else "crashed",
+            f"the test process exited with code {ret_code}{signal_name}",
+        )
+        for key in ("report_path", "report_inflight"):
+            (cache_dir / key).unlink(missing_ok=True)
 
     print_items = ["--print-items"]
     sc_command = f"--sc={stepcurrent_key}"
@@ -842,6 +873,8 @@ def run_test_retries(
             break  # Got to the end of the test suite successfully
         signal_name = f" ({SIGNALS_TO_NAMES_DICT[-ret_code]})" if ret_code < 0 else ""
         print_to_file(f"Got exit code {ret_code}{signal_name}")
+        if ret_code != 0:
+            close_report(ret_code, signal_name)
 
         # Read what just failed/ran
         try:

@@ -92,6 +92,7 @@ from torch.testing._comparison import (
     TensorLikePair,
 )
 from torch.testing._internal.common_dtype import get_all_dtypes
+from torch.testing._internal.test_report import report_path
 from torch.utils._import_utils import _check_module_exists
 import torch.utils._pytree as pytree
 from torch.utils import cpp_extension
@@ -1119,13 +1120,15 @@ def prof_meth_call(*args, **kwargs):
 torch._C.ScriptFunction.__call__ = prof_func_call  # type: ignore[method-assign]
 torch._C.ScriptMethod.__call__ = prof_meth_call  # type: ignore[method-assign]
 
+TEST_REPORTS_DIR = 'test-reports'
+
 def _get_test_report_path():
     # allow users to override the test file location. We need this
     # because the distributed tests run the same test file multiple
     # times with different configurations.
     override = os.environ.get('TEST_REPORT_SOURCE_OVERRIDE')
     test_source = override if override is not None else 'python-unittest'
-    return os.path.join('test-reports', test_source)
+    return os.path.join(TEST_REPORTS_DIR, test_source)
 
 def parse_cmd_line_args():
     global DISABLED_TESTS_FILE
@@ -1226,18 +1229,13 @@ def wait_for_process(p, timeout=None):
             p.kill()
             raise
     except subprocess.TimeoutExpired:
-        # send SIGINT to give pytest a chance to make xml
+        # Send SIGINT so pytest can write its reports, then report the timeout
+        # whatever pytest exited with: the caller logs it and run_test.py records
+        # the in-flight test as timed out.
         p.send_signal(signal.SIGINT)
-        exit_status = None
         try:
-            exit_status = p.wait(timeout=5)
-        # try to handle the case where p.wait(timeout=5) times out as well as
-        # otherwise the wait() call in the finally block can potentially hang
+            p.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            pass
-        if exit_status is not None:
-            return exit_status
-        else:
             p.kill()
         raise
     except:
@@ -1592,6 +1590,8 @@ def run_tests(argv=None):
             test_report_path = get_report_path(pytest=True)
             print(f'Test results will be stored in {test_report_path}')
             pytest_args.append(f'--junit-xml-reruns={test_report_path}')
+            report = report_path(TEST_REPORTS_DIR, argv[0])
+            pytest_args += ['-p', 'torch.testing._internal.test_report', f'--report-xml={report}']
         if PYTEST_SINGLE_TEST:
             pytest_args = PYTEST_SINGLE_TEST + pytest_args[1:]
 

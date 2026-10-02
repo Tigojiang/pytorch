@@ -163,6 +163,8 @@ def parse_xml_and_upload_json() -> None:
             f"{REPO_ROOT}/test/test-reports/**/*.xml", recursive=True
         ):
             xml_path = Path(xml_file)
+            if xml_path.name.endswith(".report.xml"):
+                continue  # the tests.* report, not junit
             json_file = xml_path.with_suffix(".json")
             lock = FileLock(str(json_file) + ".lock")
 
