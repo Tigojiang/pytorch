@@ -43,6 +43,10 @@ from torch._inductor.autotune_process import (
 from torch._inductor.codegen.common import WorkspaceArg
 from torch._inductor.graph import GraphLowering
 from torch._inductor.heuristics.registry import override_template_heuristics
+from torch._inductor.heuristics.template.decompose_k import (
+    decompose_k_split_bounds,
+    filter_decompose_k_splits,
+)
 from torch._inductor.heuristics.template.triton import (
     BlackwellGPUGemmConfig,
     CUDAAddmmPersistentTMATemplateConfigHeuristic,
@@ -1992,8 +1996,11 @@ class TestMaxAutotune(TestCase):
         "ignore decompose_k when native matmul codegen",
     )
     @config.patch(
-        max_autotune=True,
-        max_autotune_gemm_backends="TRITON",
+        {
+            "max_autotune": True,
+            "max_autotune_gemm_backends": "TRITON",
+            "triton.decompose_k_min_output_ctas": 64,
+        }
     )
     def test_max_autotune_decompose_k_dynamic_input(self):
         # UT specific change to force testing decompose K feature on ROCm until
@@ -2017,9 +2024,15 @@ class TestMaxAutotune(TestCase):
             torch._dynamo.maybe_mark_dynamic(a, 0)
             compiled_func = torch.compile(f)
 
-            with mock.patch(
-                "torch._inductor.kernel.mm.use_decompose_k_choice"
-            ) as decomp_mock:
+            with (
+                mock.patch(
+                    "torch._inductor.kernel.mm.use_decompose_k_choice"
+                ) as decomp_mock,
+                mock.patch(
+                    "torch._inductor.heuristics.template.decompose_k.filter_decompose_k_splits",
+                    wraps=filter_decompose_k_splits,
+                ) as filter_mock,
+            ):
                 decomp_mock.side_effect = (
                     lambda *args, **kwargs: kwargs.get("threshold_multiple", 1) == 1
                 )
@@ -2035,6 +2048,14 @@ class TestMaxAutotune(TestCase):
                     f(a, b),
                     atol=1e-4,
                     rtol=1e-4,
+                )
+                # Only the weight-gradient mm (32768x64 output) has static M and N.
+                # The forward mm's M is symbolic, so it keeps the unfiltered splits.
+                self.assertTrue(
+                    all(
+                        call.args[1:3] == (32768, 64)
+                        for call in filter_mock.call_args_list
+                    )
                 )
 
     @unittest.skipIf(
@@ -2876,6 +2897,8 @@ class TestMaxAutotune(TestCase):
                 {
                     "triton.num_decompose_k_splits": num_decompose_k_splits,
                     "triton.decompose_k_threshold": decompose_k_threshold,
+                    "triton.decompose_k_min_output_ctas": 0,
+                    "triton.decompose_k_max_workspace_bytes": 0,
                 }
             ):
                 compiled_func = torch.compile(lambda a, b: a @ b)
@@ -2893,8 +2916,88 @@ class TestMaxAutotune(TestCase):
                 ):
                     self.assertEqual(decompose_count, 0)
                 else:
-                    self.assertTrue(decompose_count > 0)
-                    self.assertTrue(decompose_count <= num_decompose_k_splits)
+                    self.assertEqual(
+                        decompose_count,
+                        len(get_k_splits(M, N, K)),
+                    )
+
+    @config.patch(
+        {
+            "max_autotune": True,
+            "max_autotune_gemm_backends": "TRITON",
+            "autotune_fallback_to_aten": False,
+            "triton.num_decompose_k_splits": 10,
+            "triton.decompose_k_threshold": 8,
+            "triton.decompose_k_min_output_ctas": 16,
+            "triton.decompose_k_max_workspace_bytes": 128 * 1024,
+        }
+    )
+    def test_decompose_k_split_filter_choices(self):
+        M, N, K = 32, 32, 32768
+        get_k_splits.cache_clear()
+        use_decompose_k_choice.cache_clear()
+        a = torch.randn(M, K, dtype=torch.float16, device=GPU_TYPE)
+        b = torch.randn(K, N, dtype=torch.float16, device=GPU_TYPE)
+
+        # One output tile needs split >= 16; a 128 KiB workspace allows split <= 32.
+        expected_splits = filter_decompose_k_splits(
+            get_k_splits(M, N, K), M, N, 16, 128 * 1024
+        )
+        self.assertEqual(expected_splits, [16, 32])
+
+        compiled_func = torch.compile(lambda a, b: a @ b)
+        _, code = run_and_get_code(compiled_func, a, b)
+        decompose_count = sum(
+            "benchmark_decompose_k_mm" in codegen for codegen in code
+        )
+        self.assertEqual(decompose_count, len(expected_splits))
+
+    def test_filter_decompose_k_splits(self):
+        splits = [2, 4, 8, 16, 32]
+        # 16x16 is one 64x64 output tile.
+        self.assertEqual(filter_decompose_k_splits(splits, 16, 16, 8, 0), [8, 16, 32])
+        # 1024x1024 FP32 partials take 4 MiB per split.
+        self.assertEqual(
+            filter_decompose_k_splits(splits, 1024, 1024, 0, 8 * 1024 * 1024), [2]
+        )
+        self.assertEqual(filter_decompose_k_splits(splits, 16, 16, 0, 0), splits)
+        # Never filter every split away.
+        self.assertEqual(filter_decompose_k_splits(splits, 16, 16, 1000, 0), [32])
+        self.assertEqual(filter_decompose_k_splits(splits, 1024, 1024, 0, 1), [2])
+        self.assertEqual(filter_decompose_k_splits([], 16, 16, 8, 0), [])
+
+    def test_decompose_k_split_bounds(self):
+        device = torch.device(GPU_TYPE)
+        with config.patch(
+            {
+                "triton.decompose_k_min_output_ctas": 3,
+                "triton.decompose_k_max_workspace_bytes": 0,
+            }
+        ):
+            self.assertEqual(decompose_k_split_bounds(device), (3, 0))
+
+        def bounds_for(device_type, major, multi_processor_count, hip=None):
+            props = mock.Mock(
+                type=device_type,
+                major=major,
+                multi_processor_count=multi_processor_count,
+            )
+            with (
+                config.patch(
+                    {
+                        "triton.decompose_k_min_output_ctas": None,
+                        "triton.decompose_k_max_workspace_bytes": None,
+                    }
+                ),
+                mock.patch.object(DeviceProperties, "create", return_value=props),
+                mock.patch("torch.version.hip", hip),
+            ):
+                return decompose_k_split_bounds(device)
+
+        self.assertEqual(bounds_for("cuda", 10, 148), (74, 0))
+        self.assertEqual(bounds_for("cuda", 9, 132), (8, 8 * 1024 * 1024))
+        self.assertEqual(bounds_for("cuda", 9, 304, hip="6.4"), (0, 0))
+        self.assertEqual(bounds_for("xpu", None, 64), (0, 0))
 
     @unittest.skipIf(
         config.triton.native_matmul,
